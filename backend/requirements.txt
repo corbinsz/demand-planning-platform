@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+sqlalchemy[asyncio]
+aiosqlite
+alembic
+pydantic
+pydantic-settings
+httpx
+pandas
+statsmodels
+numpy
+apscheduler
+python-dotenv
