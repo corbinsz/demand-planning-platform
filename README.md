@@ -1,8 +1,6 @@
-# Inventory Intelligence
+# Demand Planning Platform — Inventory Management Tool
 
-AI-powered demand planning for DTC brands on Shopify + ShipHero.
-
-Forecast demand, prevent stockouts, and automate reorders — instead of guessing what to buy and when.
+A full-stack demand planning application with Shopify and ShipHero API integrations for DTC e-commerce brands. Forecast demand, prevent stockouts, and automate reorders — instead of guessing what to buy and when.
 
 ## What it does
 
