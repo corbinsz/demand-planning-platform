@@ -145,7 +145,7 @@ export default function Home() {
     <div>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '28px', flexWrap: 'wrap', gap: '12px' }}>
         <div>
-          <h2 style={{ fontSize: '22px', fontWeight: 700, fontFamily: 'Poppins, sans-serif' }}>Demand Planning Dashboard</h2>
+          <h1 style={{ fontSize: '22px', fontWeight: 700, fontFamily: 'Poppins, sans-serif' }}>More numbers</h1>
           <p style={{ fontSize: '13px', color: 'var(--text-secondary)', marginTop: '4px', display: 'flex', alignItems: 'center', gap: '12px' }}>
             Forecast demand, prevent stockouts, and automate reorders across Shopify + ShipHero
             {dashboard && <DataFreshness syncData={dashboard} />}

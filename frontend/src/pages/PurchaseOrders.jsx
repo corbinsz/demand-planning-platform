@@ -4,9 +4,9 @@ export default function PurchaseOrders() {
   return (
     <div>
       <div style={{ marginBottom: '24px' }}>
-        <h2 style={{ fontSize: '22px', fontWeight: 700, fontFamily: 'Poppins, sans-serif' }}>Purchase Orders</h2>
-        <p style={{ fontSize: '13px', color: 'var(--text-secondary)', marginTop: '4px' }}>
-          Auto-generated PO suggestions sorted by urgency. Select items and export a CSV to send to your supplier.
+        <h1 style={{ fontSize: '22px', fontWeight: 700, fontFamily: 'Poppins, sans-serif' }}>What to buy</h1>
+        <p style={{ fontSize: '14px', color: 'var(--text-secondary)', marginTop: '4px' }}>
+          The buy list, most urgent first. Quantities already subtract what ShipHero has on hand. Export a CSV for your supplier.
         </p>
       </div>
       <POGenerator />

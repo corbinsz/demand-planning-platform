@@ -77,8 +77,8 @@ export default function Forecasting() {
     const reorderCount = forecasts.filter(f => f.below_reorder_point).length
     const criticalCount = forecasts.filter(f => f.days_of_stock_remaining != null && f.days_of_stock_remaining < f.lead_time_days).length
     const seasonalCount = forecasts.filter(f => f.has_seasonality).length
-    const avgDaysLeft = forecasts.filter(f => f.days_of_stock_remaining != null)
-    const avgDays = avgDaysLeft.length > 0 ? Math.round(avgDaysLeft.reduce((s, f) => s + f.days_of_stock_remaining, 0) / avgDaysLeft.length) : null
+    const runway = forecasts.map(f => f.days_of_stock_remaining).filter(d => d != null && d <= 365).sort((a, b) => a - b)
+    const avgDays = runway.length ? runway[Math.floor(runway.length / 2)] : null
     const totalForecast30 = forecasts.reduce((s, f) => s + (f.forecast_30d ?? 0), 0)
     return { reorderCount, criticalCount, seasonalCount, avgDays, totalForecast30 }
   }, [forecasts])
@@ -107,9 +107,9 @@ export default function Forecasting() {
   return (
     <div>
       <div style={{ marginBottom: '24px' }}>
-        <h2 style={{ fontSize: '22px', fontWeight: 700, fontFamily: 'Poppins, sans-serif' }}>Demand Forecasting</h2>
-        <p style={{ fontSize: '13px', color: 'var(--text-secondary)', marginTop: '4px' }}>
-          AI-powered demand predictions using exponential smoothing with seasonality detection. Tells you exactly what to reorder and when.
+        <h1 style={{ fontSize: '22px', fontWeight: 700, fontFamily: 'Poppins, sans-serif' }}>Forecast</h1>
+        <p style={{ fontSize: '14px', color: 'var(--text-secondary)', marginTop: '4px' }}>
+          Each product uses the method that was least wrong on recent history. The 30-day range is an 80% band from those checks, not a guarantee.
         </p>
       </div>
 
@@ -138,9 +138,9 @@ export default function Forecasting() {
             tooltip="SKUs where days of stock remaining is LESS than their lead time. Even if you order today, these will likely stock out before the shipment arrives. Consider expedited shipping or transferring stock between warehouses."
           />
           <SummaryCard
-            label="Avg Days of Stock"
+            label="Typical days of stock"
             value={summary.avgDays != null ? `${summary.avgDays}d` : '--'}
-            sub="across all SKUs"
+            sub="middle SKU, ignoring year-plus piles"
             tooltip="Average runway across all SKUs. Below 30 days means your catalog is running thin. Above 120 days may indicate overstock across the board."
           />
           <SummaryCard
@@ -195,6 +195,7 @@ export default function Forecasting() {
                   <tr>
                     <SortableHeader label="SKU" field="sku" sortBy={sortBy} sortDir={sortDir} onSort={handleSort} />
                     <SortableHeader label="Title" field="title" sortBy={sortBy} sortDir={sortDir} onSort={handleSort} />
+                    <th style={thStyle}>Model</th>
                     <th style={thStyle}>
                       <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
                         Velocity <InfoTooltip text="Average units sold per day over the last 30 days. This is the most important number — it drives all forecast calculations." />
@@ -231,8 +232,14 @@ export default function Forecasting() {
                     >
                       <td style={{ ...tdStyle, fontFamily: 'monospace', fontWeight: 600, color: 'var(--accent)' }}>{f.sku}</td>
                       <td style={{ ...tdStyle, maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.title}</td>
+                      <td style={{ ...tdStyle, fontSize: 12 }}>{f.model || '—'}</td>
                       <td style={{ ...tdStyle, fontWeight: 600 }}>{f.rolling_30d_avg ?? 0}/day</td>
-                      <td style={{ ...tdStyle, fontWeight: 500 }}>{Math.round(f.forecast_30d ?? 0).toLocaleString()}</td>
+                      <td style={{ ...tdStyle, fontWeight: 500 }}>
+                        {Math.round(f.forecast_30d ?? 0).toLocaleString()}
+                        <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                          {Math.round(f.confidence_low_30 ?? 0)}–{Math.round(f.confidence_high_30 ?? 0)}
+                        </div>
+                      </td>
                       <td style={{ ...tdStyle, fontWeight: 500 }}>{Math.round(f.forecast_60d ?? 0).toLocaleString()}</td>
                       <td style={{ ...tdStyle, fontWeight: 500 }}>{Math.round(f.forecast_90d ?? 0).toLocaleString()}</td>
                       <td style={{ ...tdStyle, fontWeight: 600 }}>{(f.current_stock ?? 0).toLocaleString()}</td>

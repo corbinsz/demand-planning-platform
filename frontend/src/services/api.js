@@ -5,6 +5,12 @@ const api = axios.create({
   headers: { 'Content-Type': 'application/json' },
 })
 
+api.interceptors.request.use((config) => {
+  const token = sessionStorage.getItem('ii_token')
+  if (token) config.headers.Authorization = `Bearer ${token}`
+  return config
+})
+
 // Dashboard
 export const getDashboard = () => api.get('/dashboard')
 export const getSalesTrend = (days = 30) => api.get('/dashboard/sales-trend', { params: { days } })
@@ -49,5 +55,19 @@ export const testShopifyConnection = () => api.post('/sync/test-shopify')
 export const testShipHeroConnection = () => api.post('/sync/test-shiphero')
 export const triggerShopifySync = () => api.post('/sync/trigger/shopify')
 export const triggerShipHeroSync = () => api.post('/sync/trigger/shiphero')
+
+export const getSession = () => api.get('/auth/session')
+export const login = (body) => api.post('/auth/login', body)
+export const register = (body) => api.post('/auth/register', body)
+export const getToday = () => api.get('/today')
+export const getDigest = () => api.get('/digest')
+export const getBrief = () => api.get('/reports/brief')
+export const createShareLink = () => api.post('/reports/share')
+export const getSharedBrief = (token) => api.get(`/reports/share/${token}`)
+export const getIntegrationStatus = () => api.get('/integrations/status')
+export const startShopifyConnect = (shop) => api.post('/integrations/shopify/start', { shop })
+export const connectShipHero = (refreshToken) => api.post('/integrations/shiphero/connect', { refresh_token: refreshToken })
+export const disconnectProvider = (provider) => api.delete(`/integrations/${provider}`)
+export const deleteWorkspaceData = (confirm) => api.delete('/account/data', { data: { confirm } })
 
 export default api

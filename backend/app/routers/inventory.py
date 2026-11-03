@@ -1,18 +1,21 @@
 import logging
 from dataclasses import asdict
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 
-from fastapi import APIRouter, Depends, Query, HTTPException
-from sqlalchemy import select, func
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.models.models import Product, InventorySnapshot, Order, OrderLineItem, ReorderRule
-from app.services.reconciliation import reconcile_inventory, get_discrepancies
+from app.deps import Ctx, get_ctx
+from app.models.models import InventorySnapshot, Order, OrderLineItem, Product, ReorderRule
+from app.services.reconciliation import get_discrepancies, reconcile_inventory
+from app.services.stock import latest_snapshot_subquery, summed_stock
+from app.sqlutil import day_key, like_contains
+from app.timeutil import utcnow_naive
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-
 
 INVENTORY_SORT_COLUMNS = {
     "sku": InventorySnapshot.sku,
@@ -33,9 +36,11 @@ async def list_inventory(
     source: str = Query(None),
     sort_by: str = Query("sku"),
     sort_dir: str = Query("asc", pattern="^(asc|desc)$"),
+    ctx: Ctx = Depends(get_ctx),
     db: AsyncSession = Depends(get_db),
 ):
-    """Paginated SKU inventory with search, filters, and sorting."""
+    """Current stock: the latest snapshot per SKU, warehouse, and source."""
+    latest = latest_snapshot_subquery(ctx.workspace_id, source)
     query = (
         select(
             InventorySnapshot.sku,
@@ -50,32 +55,27 @@ async def list_inventory(
             Product.cost_price,
             Product.parent_sku,
         )
-        .outerjoin(Product, InventorySnapshot.sku == Product.sku)
+        .join(latest, InventorySnapshot.id == latest.c.max_id)
+        .outerjoin(
+            Product,
+            and_(Product.workspace_id == ctx.workspace_id, Product.sku == InventorySnapshot.sku),
+        )
     )
-
     if search:
+        pattern = like_contains(search.strip())
         query = query.where(
-            InventorySnapshot.sku.ilike(f"%{search}%")
-            | Product.title.ilike(f"%{search}%")
+            InventorySnapshot.sku.ilike(pattern, escape="\\")
+            | Product.title.ilike(pattern, escape="\\")
         )
     if warehouse:
         query = query.where(InventorySnapshot.warehouse == warehouse)
     if source:
         query = query.where(InventorySnapshot.source == source)
 
-    # Count
-    count_q = select(func.count()).select_from(query.subquery())
-    total = (await db.execute(count_q)).scalar_one()
-
-    # Sort
+    total = int(await db.scalar(select(func.count()).select_from(query.subquery())) or 0)
     sort_col = INVENTORY_SORT_COLUMNS.get(sort_by, InventorySnapshot.sku)
     order = sort_col.desc() if sort_dir == "desc" else sort_col.asc()
-
-    # Paginate
-    query = query.order_by(order).offset((page - 1) * per_page).limit(per_page)
-    result = await db.execute(query)
-    rows = result.all()
-
+    result = await db.execute(query.order_by(order).offset((page - 1) * per_page).limit(per_page))
     items = [
         {
             "sku": r[0],
@@ -90,105 +90,100 @@ async def list_inventory(
             "cost_price": float(r[9]) if r[9] else None,
             "parent_sku": r[10],
         }
-        for r in rows
+        for r in result.all()
     ]
-
     return {
         "items": items,
         "total": total,
         "page": page,
         "per_page": per_page,
-        "pages": (total + per_page - 1) // per_page,
+        "pages": (total + per_page - 1) // per_page if per_page else 0,
     }
 
 
 @router.get("/reconciled")
-async def reconciled_inventory():
-    """Get unified inventory with Shopify/ShipHero reconciliation."""
+async def reconciled_inventory(ctx: Ctx = Depends(get_ctx)):
     try:
-        records = await reconcile_inventory()
-    except Exception as e:
-        logger.error(f"Inventory reconciliation failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to reconcile inventory: {e}")
+        records = await reconcile_inventory(ctx.workspace_id)
+    except Exception:
+        logger.exception("Inventory reconciliation failed")
+        raise HTTPException(status_code=500, detail="We couldn't reconcile inventory.")
     return {"items": [asdict(r) for r in records], "total": len(records)}
 
 
 @router.get("/discrepancies")
-async def inventory_discrepancies():
-    """Get SKUs with inventory discrepancies between sources."""
+async def inventory_discrepancies(ctx: Ctx = Depends(get_ctx)):
     try:
-        records = await get_discrepancies()
-    except Exception as e:
-        logger.error(f"Discrepancy check failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to check discrepancies: {e}")
+        records = await get_discrepancies(ctx.workspace_id)
+    except Exception:
+        logger.exception("Discrepancy check failed")
+        raise HTTPException(status_code=500, detail="We couldn't check discrepancies.")
     return {"items": [asdict(r) for r in records], "total": len(records)}
 
 
 @router.get("/warehouses")
-async def list_warehouses(db: AsyncSession = Depends(get_db)):
-    """Get list of distinct warehouses."""
+async def list_warehouses(ctx: Ctx = Depends(get_ctx), db: AsyncSession = Depends(get_db)):
     result = await db.execute(
         select(InventorySnapshot.warehouse)
         .distinct()
-        .where(InventorySnapshot.warehouse.isnot(None))
+        .where(
+            InventorySnapshot.workspace_id == ctx.workspace_id,
+            InventorySnapshot.warehouse.isnot(None),
+        )
     )
     return {"warehouses": [r[0] for r in result.all()]}
 
 
 @router.get("/sku/{sku}")
-async def sku_detail(sku: str, db: AsyncSession = Depends(get_db)):
-    """Full detail for a single SKU: product info, stock, sales, reorder rule."""
-    # Product info
-    prod_result = await db.execute(select(Product).where(Product.sku == sku))
-    product = prod_result.scalar_one_or_none()
+async def sku_detail(sku: str, ctx: Ctx = Depends(get_ctx), db: AsyncSession = Depends(get_db)):
+    product = (await db.execute(
+        select(Product).where(Product.workspace_id == ctx.workspace_id, Product.sku == sku)
+    )).scalar_one_or_none()
     if not product:
-        raise HTTPException(status_code=404, detail=f"SKU not found: {sku}")
+        raise HTTPException(status_code=404, detail="SKU not found.")
 
-    # Latest inventory snapshots (all sources)
-    snap_result = await db.execute(
+    snapshots = (await db.execute(
         select(InventorySnapshot)
-        .where(InventorySnapshot.sku == sku)
+        .where(InventorySnapshot.workspace_id == ctx.workspace_id, InventorySnapshot.sku == sku)
         .order_by(InventorySnapshot.recorded_at.desc())
         .limit(20)
-    )
-    snapshots = snap_result.scalars().all()
+    )).scalars().all()
 
-    # Sales history (last 90 days)
-    now = datetime.now(timezone.utc)
-    ninety_days_ago = now - timedelta(days=90)
-    sales_result = await db.execute(
+    ninety = utcnow_naive() - timedelta(days=90)
+    day = day_key(Order.created_at)
+    sales_rows = (await db.execute(
         select(
-            func.strftime('%Y-%m-%d', Order.created_at).label("date"),
-            func.sum(OrderLineItem.quantity).label("units"),
-            func.sum(OrderLineItem.price * OrderLineItem.quantity).label("revenue"),
+            day.label("date"),
+            func.sum(OrderLineItem.quantity),
+            func.sum(OrderLineItem.price * OrderLineItem.quantity),
         )
-        .join(Order, OrderLineItem.order_id == Order.order_id)
-        .where(OrderLineItem.sku == sku, Order.created_at >= ninety_days_ago)
-        .group_by(func.strftime('%Y-%m-%d', Order.created_at))
-        .order_by(func.strftime('%Y-%m-%d', Order.created_at))
-    )
-    sales_rows = sales_result.all()
-
-    # Totals
-    totals_result = await db.execute(
+        .join(Order, and_(Order.workspace_id == OrderLineItem.workspace_id, Order.order_id == OrderLineItem.order_id))
+        .where(
+            OrderLineItem.workspace_id == ctx.workspace_id,
+            OrderLineItem.sku == sku,
+            Order.created_at >= ninety,
+        )
+        .group_by(day)
+        .order_by(day)
+    )).all()
+    totals = (await db.execute(
         select(
             func.coalesce(func.sum(OrderLineItem.quantity), 0),
             func.coalesce(func.sum(OrderLineItem.price * OrderLineItem.quantity), 0),
             func.count(func.distinct(Order.order_id)),
         )
-        .join(Order, OrderLineItem.order_id == Order.order_id)
-        .where(OrderLineItem.sku == sku, Order.created_at >= ninety_days_ago)
-    )
-    totals = totals_result.one()
-
-    # Reorder rule
-    rule_result = await db.execute(
-        select(ReorderRule).where(ReorderRule.sku == sku)
-    )
-    rule = rule_result.scalar_one_or_none()
-
-    # Current stock (latest shiphero snapshot)
-    latest_snap = next((s for s in snapshots if s.source == "shiphero"), None)
+        .join(Order, and_(Order.workspace_id == OrderLineItem.workspace_id, Order.order_id == OrderLineItem.order_id))
+        .where(
+            OrderLineItem.workspace_id == ctx.workspace_id,
+            OrderLineItem.sku == sku,
+            Order.created_at >= ninety,
+        )
+    )).one()
+    rule = (await db.execute(
+        select(ReorderRule).where(ReorderRule.workspace_id == ctx.workspace_id, ReorderRule.sku == sku)
+    )).scalar_one_or_none()
+    stock = await summed_stock(db, ctx.workspace_id, "shiphero")
+    current = stock.get(sku) or {"on_hand": 0, "allocated": 0, "available": 0, "warehouses": [], "recorded_at": None}
 
     return {
         "sku": sku,
@@ -200,11 +195,11 @@ async def sku_detail(sku: str, db: AsyncSession = Depends(get_db)):
         "shiphero_id": product.shiphero_id,
         "created_at": product.created_at.isoformat() if product.created_at else None,
         "current_stock": {
-            "on_hand": latest_snap.quantity_on_hand if latest_snap else 0,
-            "allocated": latest_snap.quantity_allocated if latest_snap else 0,
-            "available": latest_snap.quantity_available if latest_snap else 0,
-            "warehouse": latest_snap.warehouse if latest_snap else None,
-            "last_updated": latest_snap.recorded_at.isoformat() if latest_snap else None,
+            "on_hand": current["on_hand"],
+            "allocated": current["allocated"],
+            "available": current["available"],
+            "warehouse": ", ".join(current["warehouses"]) or None,
+            "last_updated": current["recorded_at"].isoformat() if current["recorded_at"] else None,
         },
         "stock_history": [
             {
@@ -218,12 +213,12 @@ async def sku_detail(sku: str, db: AsyncSession = Depends(get_db)):
             for s in snapshots
         ],
         "sales_90d": {
-            "total_units": totals[0],
-            "total_revenue": float(totals[1]),
-            "total_orders": totals[2],
-            "daily_avg": round(totals[0] / 90, 2) if totals[0] else 0,
+            "total_units": int(totals[0]),
+            "total_revenue": float(totals[1] or 0),
+            "total_orders": int(totals[2]),
+            "daily_avg": round(int(totals[0]) / 90, 2) if totals[0] else 0,
             "timeline": [
-                {"date": r[0], "units": r[1], "revenue": float(r[2]) if r[2] else 0}
+                {"date": str(r[0]), "units": int(r[1] or 0), "revenue": float(r[2] or 0)}
                 for r in sales_rows
             ],
         },

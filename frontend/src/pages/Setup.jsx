@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { testShopifyConnection, testShipHeroConnection } from '../services/api'
+import ConnectPanel, { DangerZone } from '../components/ConnectPanel'
 
 const sectionStyle = {
   background: 'var(--bg-white)',
@@ -129,11 +130,12 @@ export default function Setup() {
   return (
     <div style={{ maxWidth: 800 }}>
       <div style={{ marginBottom: '28px' }}>
-        <h2 style={{ fontSize: '22px', fontWeight: 700, fontFamily: 'Poppins, sans-serif' }}>Setup Guide</h2>
-        <p style={{ fontSize: '13px', color: 'var(--text-secondary)', marginTop: '4px' }}>
-          Follow these steps to connect your integrations and start using Inventory Intel.
+        <h1 style={{ fontSize: '22px', fontWeight: 700, fontFamily: 'Poppins, sans-serif' }}>Connections</h1>
+        <p style={{ fontSize: '14px', color: 'var(--text-secondary)', marginTop: '4px' }}>
+          Connect Shopify and ShipHero for this workspace. The guide below is the detail, not the first step.
         </p>
       </div>
+      <ConnectPanel />
 
       {/* Overview */}
       <div style={{ ...sectionStyle, borderLeft: '4px solid var(--accent)' }}>
@@ -439,6 +441,7 @@ export default function Setup() {
           LOG_LEVEL=INFO
         </div>
       </Accordion>
+      <DangerZone />
     </div>
   )
 }

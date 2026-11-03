@@ -22,6 +22,14 @@ A full-stack demand planning application with Shopify and ShipHero API integrati
 **Database:** SQLite (dev), PostgreSQL (prod via Docker)
 **Integrations:** Shopify Admin REST API, ShipHero GraphQL API
 
+## Review it
+
+```bash
+./scripts/demo.sh
+```
+
+Open http://127.0.0.1:5173/ . The walkthrough is `docs/REVIEW-CHECKLIST.md`. Guides for an owner are in `docs/` (how it works, what changed, how to test, how to deploy one client, and why a brand would pay).
+
 ## Quick Start
 
 ### Local Development
