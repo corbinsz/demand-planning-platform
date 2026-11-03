@@ -33,7 +33,11 @@ def compute_reorder(
         reorder_point = max(calculated_point, int(manual_reorder_point))
 
     cover_days = 7 * weeks_of_cover
-    need = max(int(math.ceil(daily * cover_days)) - stock, 0)
+    if daily <= 0:
+        # No sales pace. Still refill up to the reorder point (safety stock).
+        need = max(reorder_point - stock, 0)
+    else:
+        need = max(int(math.ceil(daily * cover_days) + safety) - stock, 0)
     if need > 0 and moq:
         # A supplier minimum that would leave half a year of a slow seller
         # on the shelf is not a helpful buy. Show the real need instead.

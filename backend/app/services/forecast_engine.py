@@ -51,9 +51,14 @@ warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
-SKU_MODELS = ("seasonal_naive", "ets", "croston", "tsb", "hgb_sku")
+# hgb_sku stays out of the default race: it was slower than the global
+# booster and lost on every scenario we measured. hgb_global is the pooled
+# histogram gradient booster (same family as LightGBM) with lag, calendar,
+# and parent features.
+SKU_MODELS = ("seasonal_naive", "ets", "croston", "sba", "tsb")
 GLOBAL_MODEL = "hgb_global"
-ALL_MODELS = SKU_MODELS + (GLOBAL_MODEL,)
+HIERARCHICAL_MODEL = "hierarchical"
+ALL_MODELS = SKU_MODELS + (GLOBAL_MODEL, HIERARCHICAL_MODEL)
 
 _SEASON = 7
 
@@ -88,14 +93,22 @@ class SkuForecast:
     rmse: float
     intermittent: bool
     has_seasonality: bool
+    q_low: float = 0.0
+    q_high: float = 0.0
     scores: dict[str, ModelScore] = field(default_factory=dict)
 
     def sum_between(self, start: int, end: int) -> tuple[float, float, float]:
-        return (
-            float(np.sum(self.point[start:end])),
-            float(np.sum(self.lower[start:end])),
-            float(np.sum(self.upper[start:end])),
-        )
+        """Horizon total, with a band that grows like sqrt(days).
+
+        Adding the same daily error to every day treats the misses as
+        perfectly correlated and makes a 30-day range look absurdly wide.
+        """
+        horizon = max(end - start, 1)
+        point = float(np.sum(self.point[start:end]))
+        scale = float(np.sqrt(horizon))
+        low = max(0.0, point + float(self.q_low) * scale)
+        high = max(point, point + float(self.q_high) * scale)
+        return point, low, high
 
 
 @dataclass
@@ -199,8 +212,15 @@ def _weekday_baseline(raw: np.ndarray, promo: np.ndarray, start_dow: int) -> np.
     return y
 
 
-def prepare_training_series(raw: np.ndarray, uplift: np.ndarray | None, start_dow: int = 0) -> np.ndarray:
+def prepare_training_series(
+    raw: np.ndarray,
+    uplift: np.ndarray | None,
+    start_dow: int = 0,
+    stockout: np.ndarray | None = None,
+) -> np.ndarray:
     raw = _as_float(raw)
+    if stockout is not None:
+        raw = impute_stockouts(raw, stockout, start_dow)
     if uplift is None:
         return raw
     uplift = np.asarray(uplift, dtype=float)
@@ -238,9 +258,8 @@ def forecast_seasonal_naive(y: np.ndarray, horizon: int) -> np.ndarray:
     return np.full(horizon, max(mu, 0.0))
 
 
-def forecast_croston(y: np.ndarray, horizon: int, alpha: float = 0.1) -> np.ndarray:
-    """Classic Croston: smooth demand size and the gap between demands."""
-    y = _as_float(y)
+def _croston_level(y: np.ndarray, alpha: float) -> float:
+    """Smoothed demand size divided by the smoothed gap between demands."""
     z = 0.0
     p = 0.0
     q = 0
@@ -254,10 +273,76 @@ def forecast_croston(y: np.ndarray, horizon: int, alpha: float = 0.1) -> np.ndar
                 started = True
             else:
                 z = z + alpha * (float(value) - z)
-                p = p + alpha * (q - p)
+                p = p + alpha * (float(q) - p)
             q = 0
-    rate = (z / p) if started and p > 0 else 0.0
+    if not started or p <= 0:
+        return 0.0
+    return max(z / p, 0.0)
+
+
+def forecast_croston(y: np.ndarray, horizon: int, alpha: float = 0.1) -> np.ndarray:
+    """Classic Croston: smooth demand size and the gap between demands."""
+    y = _as_float(y)
+    rate = _croston_level(y, alpha)
+    return _cap(np.full(horizon, rate), y)
+
+
+def forecast_sba(y: np.ndarray, horizon: int, alpha: float = 0.1) -> np.ndarray:
+    """Syntetos-Boylan approximation.
+
+    Croston is biased high. SBA multiplies by (1 - alpha/2), which is the
+    usual correction for intermittent demand.
+    """
+    y = _as_float(y)
+    rate = _croston_level(y, alpha) * (1.0 - alpha / 2.0)
     return _cap(np.full(horizon, max(rate, 0.0)), y)
+
+
+def impute_stockouts(y: np.ndarray, stockout: np.ndarray, start_dow: int = 0) -> np.ndarray:
+    """Replace stockout days with the usual same-weekday demand.
+
+    A zero on a day the warehouse was empty is censored demand, not a
+    true zero. Filling it stops the model from learning 'we stopped selling'.
+    """
+    raw = _as_float(y)
+    mask = np.asarray(stockout, dtype=bool)
+    if mask.shape != raw.shape or not mask.any():
+        return raw
+    return _weekday_baseline(raw, mask, start_dow)
+
+
+def hierarchical_forecast(
+    series: dict[str, np.ndarray],
+    parents: dict[str, str],
+    horizon: int,
+) -> dict[str, np.ndarray]:
+    """Top-down: forecast the parent, split by recent child share.
+
+    A rare size inherits the parent's seasonality instead of being fit
+    on a string of zeros.
+    """
+    groups: dict[str, list[str]] = {}
+    for sku in series:
+        parent = parents.get(sku) or sku
+        groups.setdefault(parent, []).append(sku)
+    out: dict[str, np.ndarray] = {}
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        stacked = np.sum([_as_float(series[sku]) for sku in members], axis=0)
+        parent_fc = forecast_ets(stacked, horizon)
+        if parent_fc is None:
+            parent_fc = forecast_seasonal_naive(stacked, horizon)
+        window = min(28, len(stacked))
+        weights = [float(np.sum(_as_float(series[sku])[-window:])) for sku in members]
+        total = sum(weights)
+        if total <= 0:
+            share = [1.0 / len(members)] * len(members)
+        else:
+            share = [w / total for w in weights]
+        for sku, portion in zip(members, share, strict=True):
+            out[sku] = _cap(parent_fc * portion, series[sku])
+    return out
 
 
 def forecast_tsb(y: np.ndarray, horizon: int, alpha: float = 0.1, beta: float = 0.1) -> np.ndarray:
@@ -317,7 +402,14 @@ def forecast_ets(y: np.ndarray, horizon: int) -> np.ndarray | None:
         return None
 
 
-def _feature_row(hist: np.ndarray, t: int, start_dow: int, sku_code: float) -> list[float]:
+def _feature_row(
+    hist: np.ndarray,
+    t: int,
+    start_dow: int,
+    sku_code: float,
+    parent_code: float = 0.0,
+) -> list[float]:
+    day = start_dow + t
     return [
         float(hist[t - 1]),
         float(hist[t - 7]),
@@ -325,20 +417,22 @@ def _feature_row(hist: np.ndarray, t: int, start_dow: int, sku_code: float) -> l
         float(hist[t - 28]),
         float(np.mean(hist[t - 7:t])),
         float(np.mean(hist[t - 28:t])),
-        float((start_dow + t) % 7),
+        float(day % 7),
+        float((day // 30) % 12),
         float(sku_code),
+        float(parent_code),
         float(np.mean(hist[:t])),
     ]
 
 
-def _design(y: np.ndarray, end: int, sku_code: float, start_dow: int):
+def _design(y: np.ndarray, end: int, sku_code: float, start_dow: int, parent_code: float = 0.0):
     rows = []
     targets = []
     for t in range(28, end):
-        rows.append(_feature_row(y, t, start_dow, sku_code))
+        rows.append(_feature_row(y, t, start_dow, sku_code, parent_code))
         targets.append(float(y[t]))
     if not rows:
-        return np.empty((0, 9)), np.empty((0,))
+        return np.empty((0, 11)), np.empty((0,))
     return np.asarray(rows, dtype=float), np.asarray(targets, dtype=float)
 
 
@@ -354,7 +448,14 @@ def _new_hgb(min_samples_leaf: int):
     )
 
 
-def _recursive_hgb(model, history: np.ndarray, horizon: int, start_dow: int, sku_code: float) -> np.ndarray:
+def _recursive_hgb(
+    model,
+    history: np.ndarray,
+    horizon: int,
+    start_dow: int,
+    sku_code: float,
+    parent_code: float = 0.0,
+) -> np.ndarray:
     hist = list(_as_float(history))
     out = []
     for _ in range(horizon):
@@ -362,7 +463,10 @@ def _recursive_hgb(model, history: np.ndarray, horizon: int, start_dow: int, sku
         if t < 28:
             pred = float(np.mean(hist)) if hist else 0.0
         else:
-            feat = np.asarray([_feature_row(np.asarray(hist), t, start_dow, sku_code)], dtype=float)
+            feat = np.asarray(
+                [_feature_row(np.asarray(hist), t, start_dow, sku_code, parent_code)],
+                dtype=float,
+            )
             pred = float(model.predict(feat)[0])
         pred = max(0.0, pred)
         out.append(pred)
@@ -382,13 +486,20 @@ def fit_hgb_sku(y: np.ndarray, start_dow: int = 0):
     return model
 
 
-def fit_hgb_global(series: dict[str, np.ndarray], end: int | None, codes: dict[str, float], start_dow: int):
+def fit_hgb_global(
+    series: dict[str, np.ndarray],
+    end: int | None,
+    codes: dict[str, float],
+    start_dow: int,
+    parent_codes: dict[str, float] | None = None,
+):
     chunks_x = []
     chunks_y = []
+    parent_codes = parent_codes or {}
     for sku, y in series.items():
         y = _as_float(y)
         stop = len(y) if end is None else end
-        X, target = _design(y, stop, codes[sku], start_dow)
+        X, target = _design(y, stop, codes[sku], start_dow, parent_codes.get(sku, 0.0))
         if len(target):
             chunks_x.append(X)
             chunks_y.append(target)
@@ -412,6 +523,7 @@ def _predict_model(
     sku_code: float,
     hgb_sku_model,
     hgb_global_model,
+    parent_code: float = 0.0,
 ) -> np.ndarray | None:
     if model_name == "seasonal_naive":
         return forecast_seasonal_naive(y, horizon)
@@ -419,6 +531,8 @@ def _predict_model(
         return forecast_ets(y, horizon)
     if model_name == "croston":
         return forecast_croston(y, horizon)
+    if model_name == "sba":
+        return forecast_sba(y, horizon)
     if model_name == "tsb":
         return forecast_tsb(y, horizon)
     if model_name == "hgb_sku":
@@ -428,7 +542,7 @@ def _predict_model(
     if model_name == "hgb_global":
         if hgb_global_model is None:
             return None
-        return _recursive_hgb(hgb_global_model, y, horizon, start_dow, sku_code)
+        return _recursive_hgb(hgb_global_model, y, horizon, start_dow, sku_code, parent_code)
     raise KeyError(model_name)
 
 
@@ -473,6 +587,19 @@ def _align(series: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     return out
 
 
+def _align_mask(masks: dict[str, np.ndarray] | None, series: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    out = {}
+    for sku, values in series.items():
+        if not masks or sku not in masks:
+            out[sku] = np.zeros(len(values), dtype=bool)
+            continue
+        mask = np.asarray(masks[sku], dtype=bool).reshape(-1)
+        if len(mask) < len(values):
+            mask = np.pad(mask, (len(values) - len(mask), 0), constant_values=False)
+        out[sku] = mask[: len(values)]
+    return out
+
+
 def _align_uplift(uplift: dict[str, np.ndarray] | None, series: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     out = {}
     for sku, y in series.items():
@@ -496,16 +623,22 @@ def run_portfolio(
     start_dow: int = 0,
     uplift: dict[str, np.ndarray] | None = None,
     future_uplift: dict[str, np.ndarray] | None = None,
+    parents: dict[str, str] | None = None,
+    stockout: dict[str, np.ndarray] | None = None,
 ) -> PortfolioResult:
     """Backtest every model and forecast `horizon` days for each SKU."""
     series = _align({k: v for k, v in series.items() if len(_as_float(v)) > 0})
     uplift = _align_uplift(uplift, series)
+    stockout = _align_mask(stockout, series)
     if not series:
         return PortfolioResult("seasonal_naive", {}, {}, 0.0, 0.0, 0, 0, {})
 
     n = len(next(iter(series.values())))
     origins = choose_origins(n, backtest_horizon, step, min_train)
     codes = {sku: float(i) for i, sku in enumerate(sorted(series))}
+    parents = parents or {}
+    parent_ids = sorted({parents.get(sku) or sku for sku in series})
+    parent_codes = {sku: float(parent_ids.index(parents.get(sku) or sku)) for sku in series}
 
     # Residuals and errors collected per sku per model.
     bucket: dict[str, dict[str, list]] = {
@@ -517,19 +650,23 @@ def run_portfolio(
         bucket[sku][model_name].append(resid)
 
     for origin in origins:
-        global_model = fit_hgb_global(series, origin, codes, start_dow)
-        sku_models = {}
+        trained = {
+            sku: prepare_training_series(
+                raw[:origin], uplift[sku][:origin], start_dow, stockout[sku][:origin]
+            )
+            for sku, raw in series.items()
+        }
+        global_model = fit_hgb_global(trained, None, codes, start_dow, parent_codes)
+        hier = hierarchical_forecast(trained, parents, backtest_horizon)
         for sku, raw in series.items():
-            train_raw = raw[:origin]
-            train = prepare_training_series(train_raw, uplift[sku][:origin], start_dow)
-            sku_models[sku] = fit_hgb_sku(train, start_dow)
+            train = trained[sku]
             hold_uplift = uplift[sku][origin:origin + backtest_horizon]
             actual = raw[origin:origin + backtest_horizon]
             for name in SKU_MODELS:
                 pred = _predict_model(
                     name, train, backtest_horizon,
                     start_dow=start_dow, sku_code=0.0,
-                    hgb_sku_model=sku_models[sku], hgb_global_model=None,
+                    hgb_sku_model=None, hgb_global_model=None,
                 )
                 if pred is None:
                     continue
@@ -539,9 +676,12 @@ def run_portfolio(
                     GLOBAL_MODEL, train, backtest_horizon,
                     start_dow=start_dow, sku_code=codes[sku],
                     hgb_sku_model=None, hgb_global_model=global_model,
+                    parent_code=parent_codes[sku],
                 )
                 if pred is not None:
                     _record(sku, GLOBAL_MODEL, actual, pred * hold_uplift)
+            if sku in hier:
+                _record(sku, HIERARCHICAL_MODEL, actual, hier[sku] * hold_uplift)
 
     scores: dict[str, dict[str, ModelScore]] = {}
     for sku, raw in series.items():
@@ -583,8 +723,13 @@ def run_portfolio(
     else:
         global_winner = "seasonal_naive"
 
-    # Final fits on the full (promo-adjusted) history.
-    final_global = fit_hgb_global(series, None, codes, start_dow)
+    # Final fits on the full (promo-adjusted, stockout-imputed) history.
+    trained_full = {
+        sku: prepare_training_series(raw, uplift[sku], start_dow, stockout[sku])
+        for sku, raw in series.items()
+    }
+    final_global = fit_hgb_global(trained_full, None, codes, start_dow, parent_codes)
+    final_hier = hierarchical_forecast(trained_full, parents, horizon)
     skus: dict[str, SkuForecast] = {}
     per_sku_wins = 0
     global_wins = 0
@@ -593,8 +738,7 @@ def run_portfolio(
     baseline_acc = 0.0
 
     for sku, raw in series.items():
-        train = prepare_training_series(raw, uplift[sku], start_dow)
-        sku_model = fit_hgb_sku(train, start_dow)
+        train = trained_full[sku]
         sku_scores = scores.get(sku, {})
         finite = {m: s for m, s in sku_scores.items() if np.isfinite(s.mase)}
         if not finite:
@@ -621,13 +765,17 @@ def run_portfolio(
         else:
             global_wins += 1
 
-        pred = _predict_model(
-            chosen, train, horizon,
-            start_dow=start_dow,
-            sku_code=codes[sku],
-            hgb_sku_model=sku_model,
-            hgb_global_model=final_global,
-        )
+        if chosen == HIERARCHICAL_MODEL and sku in final_hier:
+            pred = final_hier[sku]
+        else:
+            pred = _predict_model(
+                chosen, train, horizon,
+                start_dow=start_dow,
+                sku_code=codes[sku],
+                hgb_sku_model=None,
+                hgb_global_model=final_global,
+                parent_code=parent_codes[sku],
+            )
         if pred is None:
             pred = forecast_seasonal_naive(train, horizon)
             chosen = "seasonal_naive"
@@ -653,9 +801,11 @@ def run_portfolio(
             if not np.isfinite(sigma):
                 sigma = 1.0
             q10, q90 = -1.28155156554 * sigma, 1.28155156554 * sigma
-        # The published band always contains the point forecast.
-        lower = np.minimum(pred, np.clip(pred + float(q10), 0, None))
-        upper = np.maximum(pred, pred + float(q90))
+        q_low = float(q10)
+        q_high = float(q90)
+        # Daily band, for charts. The summed range uses sqrt(horizon) instead.
+        lower = np.minimum(pred, np.clip(pred + q_low, 0, None))
+        upper = np.maximum(pred, pred + q_high)
         upper = np.maximum(upper, lower)
 
         chosen_score = sku_scores.get(chosen)
@@ -672,6 +822,8 @@ def run_portfolio(
             rmse=float(rmse) if np.isfinite(rmse) else 0.0,
             intermittent=is_intermittent(raw),
             has_seasonality=has_weekly_seasonality(raw),
+            q_low=q_low,
+            q_high=q_high,
             scores=sku_scores,
         )
         w = weights[sku]

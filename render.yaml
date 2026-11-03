@@ -1,0 +1,24 @@
+# One-click demo. Render builds the Dockerfile and gives you a URL.
+# Demo mode, fictional Northline data, no Shopify or ShipHero credentials.
+services:
+  - type: web
+    name: inventory-intel-demo
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health
+    envVars:
+      - key: DEMO_MODE
+        value: "true"
+      - key: AUTO_SEED
+        value: "true"
+      - key: USE_SQLITE
+        value: "true"
+      - key: SQLITE_PATH
+        value: /tmp/inventory.db
+      - key: WARM_FORECASTS
+        value: "true"
+      - key: SCHEDULER_ENABLED
+        value: "false"
+      - key: SECRET_KEY
+        value: demo-only-not-for-production

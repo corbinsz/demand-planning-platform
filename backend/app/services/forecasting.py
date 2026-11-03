@@ -97,9 +97,14 @@ async def _load_inputs(workspace_id: int):
         )
         rows = result.all()
         titles_result = await session.execute(
-            select(Product.sku, Product.title).where(Product.workspace_id == workspace_id)
+            select(Product.sku, Product.title, Product.parent_sku).where(Product.workspace_id == workspace_id)
         )
-        titles = {sku: title or "Unknown" for sku, title in titles_result.all()}
+        titles = {}
+        parents = {}
+        for sku, title, parent in titles_result.all():
+            titles[sku] = title or "Unknown"
+            if parent:
+                parents[sku] = parent
         rules_result = await session.execute(
             select(ReorderRule).where(ReorderRule.workspace_id == workspace_id)
         )
@@ -139,7 +144,7 @@ async def _load_inputs(workspace_id: int):
     future = uplift_for(future_index)
     uplift = {sku: history_uplift.copy() for sku in series}
     future_uplift = {sku: future.copy() for sku in series}
-    return series, titles, rules, stock, int(index[0].dayofweek), uplift, future_uplift
+    return series, titles, rules, stock, int(index[0].dayofweek), uplift, future_uplift, parents
 
 
 def _to_row(sku: str, title: str, fc: SkuForecast, rule, stock_row: dict | None) -> SKUForecast:
@@ -191,7 +196,7 @@ def _to_row(sku: str, title: str, fc: SkuForecast, rule, stock_row: dict | None)
 
 
 async def _build(workspace_id: int) -> tuple[list[SKUForecast], dict]:
-    series, titles, rules, stock, start_dow, uplift, future = await _load_inputs(workspace_id)
+    series, titles, rules, stock, start_dow, uplift, future, parents = await _load_inputs(workspace_id)
     if not series:
         report = {
             "global_winner": None,
@@ -209,6 +214,7 @@ async def _build(workspace_id: int) -> tuple[list[SKUForecast], dict]:
             start_dow=start_dow,
             uplift=uplift,
             future_uplift=future,
+            parents=parents,
         )
 
     portfolio = await asyncio.to_thread(_run)

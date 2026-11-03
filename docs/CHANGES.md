@@ -1,5 +1,22 @@
 # What changed, and why
 
+## Second pass
+
+The forecast gain on the smooth sample was small, so the second pass only kept methods that beat Holt-Winters on a situation it handles badly:
+
+- **Parent forecast, split by size.** A rare size borrows the parent’s seasonality instead of being fit on a string of zeros. On a synthetic six-size shoe, that top-down forecast beat per-size Holt-Winters by more than 5% (demand-weighted MASE). It is in the model race, and a size uses it only when its own replay agrees.
+- **Stockout days are not treated as “nobody wanted it.”** If we know the warehouse was empty, those zeros are filled with the usual weekday demand before fitting. On a censored seasonal series, that cut the error against the demand that was actually there.
+- **A rising trend.** Holt-Winters beats “repeat last week” when demand is climbing. That stays.
+- **SBA** (the usual Croston bias correction) is available for intermittent SKUs and is used only when the replay says it is better. It is not forced.
+- **Pooled gradient boosting** now sees day-of-week, month, and which parent a SKU belongs to. Per-SKU boosting was dropped from the race: it was the slow piece and it lost.
+- **Ranges got narrower in an honest way.** A 30-day total no longer adds the worst daily miss thirty times. The band grows with the square root of the number of days, so it stops saying “somewhere between 0 and 80” for a forecast of 25.
+
+Reorder math now refills safety stock even when recent sales are zero, and the order quantity includes safety stock. Tests went from 15 to 39, including tenant isolation (one brand cannot read, edit, share, or delete the other).
+
+Hosted preview: there is no Render login on this machine, so there is no live URL yet. `docs/PREVIEW.md` is the one-click path (Deploy to Render). The site is one container: the API serves the built pages, so the owner does not run Docker locally.
+
+## First pass
+
 The audit of the original app is in `docs/AUDIT.md`. This file is what we did about it, for an owner who does not live in the code. The product owner is in Utah. Copy that mentions a clock uses Mountain Time (Utah). The sample brand’s main warehouse is Salt Lake City, not a Colorado site. There was no Colorado assumption in the old docs; the new ones do not add one.
 
 ## The idea of the product

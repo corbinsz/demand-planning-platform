@@ -1,9 +1,11 @@
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from app.config import get_settings
 from app.routers import (
@@ -128,3 +130,24 @@ async def health():
         "database": database,
         "demo_mode": settings.demo_mode,
     }
+
+
+_STATIC = Path(__file__).resolve().parents[1] / "static"
+if (_STATIC / "assets").is_dir():
+    app.mount("/assets", StaticFiles(directory=_STATIC / "assets"), name="assets")
+
+
+@app.get("/{full_path:path}")
+async def spa(full_path: str):
+    """Serve the built frontend when this process is the whole demo site."""
+    if full_path == "api" or full_path.startswith("api/"):
+        raise HTTPException(status_code=404, detail="Not found.")
+    if not _STATIC.is_dir():
+        raise HTTPException(status_code=404, detail="Not found.")
+    candidate = (_STATIC / full_path).resolve()
+    if full_path and candidate.is_file() and str(candidate).startswith(str(_STATIC.resolve())):
+        return FileResponse(candidate)
+    index = _STATIC / "index.html"
+    if index.is_file():
+        return FileResponse(index)
+    raise HTTPException(status_code=404, detail="Not found.")

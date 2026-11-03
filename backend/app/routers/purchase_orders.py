@@ -32,7 +32,7 @@ async def list_purchase_orders(ctx: Ctx = Depends(get_ctx), db: AsyncSession = D
         return {
             "items": [],
             "total": 0,
-            "notice": "ShipHero is not connected. Reorder recommendations below still use your order history.",
+            "notice": "ShipHero is not connected. The What to buy tab is based on your order history.",
         }
     try:
         pos = await open_purchase_orders(auth.access_token)

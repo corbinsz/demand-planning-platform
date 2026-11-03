@@ -1,8 +1,12 @@
 # Review checklist
 
-Run `./scripts/demo.sh` from the project folder, then open http://127.0.0.1:5173/ .
+You do not need Docker.
 
-There is no hosted preview with this branch. A public URL needs a cloud account, and none is configured here. The one command above is the review path. It uses only the fictional Northline Athletics brand (Salt Lake City). It does not call Shopify or ShipHero.
+**Hosted:** [Deploy the demo to Render](https://render.com/deploy?repo=https://github.com/corbinsz/demand-planning-platform). Sign in with GitHub, pick this branch if it asks, and open the `.onrender.com` URL. The exact clicks are in `docs/PREVIEW.md`. This machine has no Render login, so the URL is created when you click, not before.
+
+**On a laptop, no Docker:** `./scripts/demo.sh`, then http://127.0.0.1:5173/ .
+
+Either way you are looking at the fictional Northline Athletics brand in Salt Lake City. It does not call Shopify or ShipHero.
 
 Plan on about ten minutes. The clock in the product copy is Mountain Time (Utah).
 

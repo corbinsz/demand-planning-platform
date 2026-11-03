@@ -230,7 +230,7 @@ export default function Forecasting() {
                       onMouseEnter={e => { if (i % 2 === 0) e.currentTarget.style.background = 'var(--bg-primary)' }}
                       onMouseLeave={e => { if (i % 2 === 0) e.currentTarget.style.background = 'var(--bg-white)' }}
                     >
-                      <td style={{ ...tdStyle, fontFamily: 'monospace', fontWeight: 600, color: 'var(--accent)' }}>{f.sku}</td>
+                      <td style={{ ...tdStyle, fontFamily: 'monospace', fontWeight: 600, color: 'var(--accent)', whiteSpace: 'nowrap' }}>{f.sku}</td>
                       <td style={{ ...tdStyle, maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.title}</td>
                       <td style={{ ...tdStyle, fontSize: 12 }}>{f.model || '—'}</td>
                       <td style={{ ...tdStyle, fontWeight: 600 }}>{f.rolling_30d_avg ?? 0}/day</td>
