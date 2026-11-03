@@ -1,0 +1,29 @@
+{
+  "sku_count": 60,
+  "report": {
+    "global_winner": "ets",
+    "global_mase": {
+      "seasonal_naive": 1.0186,
+      "ets": 0.734,
+      "croston": 0.8385,
+      "tsb": 0.7762,
+      "hgb_sku": 0.7888,
+      "hgb_global": 0.7686
+    },
+    "unweighted_mase": {
+      "seasonal_naive": 1.0569,
+      "ets": 0.8081,
+      "croston": 0.9203,
+      "tsb": 0.899,
+      "hgb_sku": 0.8846,
+      "hgb_global": 0.9085
+    },
+    "baseline_ets_mase": 0.734,
+    "selected_mase": 0.7234,
+    "per_sku_wins": 10,
+    "global_wins": 50,
+    "sku_count": 60,
+    "lift_vs_ets": 0.0106
+  },
+  "note": "Northline Athletics seeded catalog after demo story pins. Demand-weighted MASE. Lower is better. 1.0 matches repeating last week."
+}

@@ -1,132 +1,132 @@
+"""Scheduled jobs.
+
+Nothing calls Shopify or ShipHero on boot. Interval-style work uses cron
+so a restart does not immediately hit a vendor API. The weekly note is
+Monday 8:00am Mountain Time (Utah), which is 15:00 UTC in standard time.
+"""
+
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from apscheduler.triggers.interval import IntervalTrigger
+from sqlalchemy import select
 
+from app.config import get_settings
 from app.database import async_session
-from app.models.models import JobLog
+from app.models.models import JobLog, Workspace
+from app.services.credentials import get_shiphero_auth, get_shopify_auth
+from app.timeutil import utcnow_naive
 
 logger = logging.getLogger(__name__)
 
 scheduler = AsyncIOScheduler()
 
 
-async def _log_job(job_name: str, status: str, started: datetime, error: str | None = None, count: int | None = None):
-    """Log job run to database."""
+async def _log_job(workspace_id: int | None, job_name: str, status: str, started: datetime, error: str | None = None, count: int | None = None):
     async with async_session() as session:
-        log = JobLog(
+        session.add(JobLog(
+            workspace_id=workspace_id,
             job_name=job_name,
             status=status,
             started_at=started,
-            finished_at=datetime.now(timezone.utc),
-            error_message=error,
+            finished_at=utcnow_naive(),
+            error_message=(error or "")[:500] or None,
             records_processed=count,
-        )
-        session.add(log)
+        ))
         await session.commit()
 
 
+async def _workspace_ids() -> list[int]:
+    async with async_session() as session:
+        rows = await session.execute(select(Workspace.id))
+        return [row[0] for row in rows.all()]
+
+
 async def shopify_full_sync_job():
-    """Nightly full Shopify sync."""
-    started = datetime.now(timezone.utc)
-    try:
-        from app.services.shopify_sync import full_sync
-        result = await full_sync()
-        total = sum(result.values())
-        await _log_job("shopify_full_sync", "success", started, count=total)
-        logger.info(f"Shopify full sync completed: {result}")
-    except Exception as e:
-        logger.error(f"Shopify full sync failed: {e}")
-        await _log_job("shopify_full_sync", "failed", started, error=str(e))
+    from app.services.shopify_sync import full_sync
+    for workspace_id in await _workspace_ids():
+        started = utcnow_naive()
+        async with async_session() as session:
+            auth = await get_shopify_auth(session, workspace_id)
+        if auth is None:
+            continue
+        try:
+            result = await full_sync(workspace_id, auth.domain, auth.token)
+            await _log_job(workspace_id, "shopify_full_sync", "success", started, count=sum(result.values()))
+        except Exception:
+            logger.exception("Shopify sync failed for workspace %s", workspace_id)
+            await _log_job(workspace_id, "shopify_full_sync", "failed", started, error="Sync failed")
 
 
 async def shiphero_sync_job():
-    """ShipHero inventory sync every 4 hours."""
-    started = datetime.now(timezone.utc)
-    try:
-        from app.services.shiphero_sync import full_sync
-        result = await full_sync()
-        total = result.get("inventory_synced", 0)
-        await _log_job("shiphero_sync", "success", started, count=total)
-        logger.info(f"ShipHero sync completed: {result}")
-    except Exception as e:
-        logger.error(f"ShipHero sync failed: {e}")
-        await _log_job("shiphero_sync", "failed", started, error=str(e))
+    from app.services.shiphero_sync import full_sync
+    for workspace_id in await _workspace_ids():
+        started = utcnow_naive()
+        async with async_session() as session:
+            auth = await get_shiphero_auth(session, workspace_id)
+        if auth is None:
+            continue
+        try:
+            result = await full_sync(workspace_id, auth.access_token)
+            await _log_job(workspace_id, "shiphero_sync", "success", started, count=result.get("inventory_synced", 0))
+        except Exception:
+            logger.exception("ShipHero sync failed for workspace %s", workspace_id)
+            await _log_job(workspace_id, "shiphero_sync", "failed", started, error="Sync failed")
 
 
 async def forecasting_job():
-    """Nightly forecast recalculation + reorder rule update."""
-    started = datetime.now(timezone.utc)
-    try:
-        from app.services.forecasting import update_reorder_rules
-        count = await update_reorder_rules()
-        await _log_job("forecasting", "success", started, count=count)
-        logger.info(f"Forecasting completed for {count} SKUs")
-    except Exception as e:
-        logger.error(f"Forecasting failed: {e}")
-        await _log_job("forecasting", "failed", started, error=str(e))
+    from app.services.forecasting import invalidate_forecast_cache, update_reorder_points
+    for workspace_id in await _workspace_ids():
+        started = utcnow_naive()
+        try:
+            invalidate_forecast_cache(workspace_id)
+            count = await update_reorder_points(workspace_id)
+            await _log_job(workspace_id, "forecasting", "success", started, count=count)
+        except Exception:
+            logger.exception("Forecasting failed for workspace %s", workspace_id)
+            await _log_job(workspace_id, "forecasting", "failed", started, error="Forecast failed")
 
 
 async def reconciliation_job():
-    """Reconciliation every 4 hours."""
-    started = datetime.now(timezone.utc)
-    try:
-        from app.services.reconciliation import reconcile_inventory
-        records = await reconcile_inventory()
-        await _log_job("reconciliation", "success", started, count=len(records))
-        logger.info(f"Reconciliation completed for {len(records)} SKUs")
-    except Exception as e:
-        logger.error(f"Reconciliation failed: {e}")
-        await _log_job("reconciliation", "failed", started, error=str(e))
+    from app.services.reconciliation import reconcile_inventory
+    for workspace_id in await _workspace_ids():
+        started = utcnow_naive()
+        try:
+            records = await reconcile_inventory(workspace_id)
+            await _log_job(workspace_id, "reconciliation", "success", started, count=len(records))
+        except Exception:
+            logger.exception("Reconciliation failed for workspace %s", workspace_id)
+            await _log_job(workspace_id, "reconciliation", "failed", started, error="Reconciliation failed")
+
+
+async def weekly_digest_job():
+    from app.services.alerts import dispatch_weekly_digest
+    for workspace_id in await _workspace_ids():
+        try:
+            await dispatch_weekly_digest(workspace_id)
+        except Exception:
+            logger.exception("Weekly digest failed for workspace %s", workspace_id)
 
 
 def start_scheduler():
-    """Configure and start the APScheduler."""
-    # Shopify full sync — nightly at 2am UTC
-    scheduler.add_job(
-        shopify_full_sync_job,
-        trigger=CronTrigger(hour=2, minute=0),
-        id="shopify_full_sync",
-        name="Shopify Full Sync",
-        replace_existing=True,
-    )
-
-    # ShipHero sync — every 4 hours
-    scheduler.add_job(
-        shiphero_sync_job,
-        trigger=IntervalTrigger(hours=4),
-        id="shiphero_sync",
-        name="ShipHero Sync",
-        replace_existing=True,
-    )
-
-    # Forecasting — nightly at 3am UTC
-    scheduler.add_job(
-        forecasting_job,
-        trigger=CronTrigger(hour=3, minute=0),
-        id="forecasting",
-        name="Forecast Recalculation",
-        replace_existing=True,
-    )
-
-    # Reconciliation — every 4 hours, offset by 30 min from ShipHero sync
-    recon_start = datetime.now(timezone.utc) + timedelta(minutes=30)
-    scheduler.add_job(
-        reconciliation_job,
-        trigger=IntervalTrigger(hours=4, start_date=recon_start),
-        id="reconciliation",
-        name="Inventory Reconciliation",
-        replace_existing=True,
-    )
-
+    settings = get_settings()
+    if not settings.scheduler_enabled:
+        logger.info("Scheduler disabled")
+        return
+    if scheduler.running:
+        return
+    scheduler.add_job(shopify_full_sync_job, CronTrigger(hour=2, minute=0), id="shopify_full_sync", replace_existing=True)
+    scheduler.add_job(shiphero_sync_job, CronTrigger(hour="1,5,9,13,17,21", minute=15), id="shiphero_sync", replace_existing=True)
+    scheduler.add_job(forecasting_job, CronTrigger(hour=3, minute=10), id="forecasting", replace_existing=True)
+    scheduler.add_job(reconciliation_job, CronTrigger(hour="2,6,10,14,18,22", minute=40), id="reconciliation", replace_existing=True)
+    # Monday 15:00 UTC = 8:00am Mountain Standard Time (Utah).
+    scheduler.add_job(weekly_digest_job, CronTrigger(day_of_week="mon", hour=15, minute=0), id="weekly_digest", replace_existing=True)
     scheduler.start()
-    logger.info("Scheduler started with 4 jobs configured")
+    logger.info("Scheduler started (no jobs run at boot)")
 
 
 def shutdown_scheduler():
-    """Gracefully shut down the scheduler."""
     if scheduler.running:
         scheduler.shutdown(wait=False)
         logger.info("Scheduler shut down")

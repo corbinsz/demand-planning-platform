@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { testShopifyConnection, testShipHeroConnection } from '../services/api'
+import ConnectPanel, { DangerZone } from '../components/ConnectPanel'
 
 const sectionStyle = {
   background: 'var(--bg-white)',
@@ -129,19 +130,20 @@ export default function Setup() {
   return (
     <div style={{ maxWidth: 800 }}>
       <div style={{ marginBottom: '28px' }}>
-        <h2 style={{ fontSize: '22px', fontWeight: 700, fontFamily: 'Poppins, sans-serif' }}>Setup Guide</h2>
-        <p style={{ fontSize: '13px', color: 'var(--text-secondary)', marginTop: '4px' }}>
-          Follow these steps to connect your integrations and start using Inventory Intel.
+        <h1 style={{ fontSize: '22px', fontWeight: 700, fontFamily: 'Poppins, sans-serif' }}>Connections</h1>
+        <p style={{ fontSize: '14px', color: 'var(--text-secondary)', marginTop: '4px' }}>
+          Connect Shopify and ShipHero for this workspace. The guide below is the detail, not the first step.
         </p>
       </div>
+      <ConnectPanel />
 
       {/* Overview */}
       <div style={{ ...sectionStyle, borderLeft: '4px solid var(--accent)' }}>
         <h3 style={h3Style}>How It Works</h3>
         <p style={{ color: 'var(--text-secondary)', fontSize: '14px', lineHeight: 1.8 }}>
           Inventory Intel connects to your <strong>Shopify</strong> store and <strong>ShipHero</strong> warehouse
-          to create a unified view of your inventory. It automatically syncs product data, orders, and stock
-          levels on a schedule, then uses AI-powered demand forecasting to tell you exactly what to reorder and when.
+          to create a unified view of your inventory. It syncs products, orders, and warehouse stock,
+          then tells you what will run out and what to buy. The connect form above is the way in. The steps further down are the long version.
         </p>
         <div style={{ display: 'flex', gap: '16px', marginTop: '20px', flexWrap: 'wrap' }}>
           {[
@@ -164,7 +166,7 @@ export default function Setup() {
       </div>
 
       {/* Shopify Integration */}
-      <Accordion title={<><span style={stepNum}>1</span> Connect Shopify</>} defaultOpen={true}>
+      <Accordion title={<><span style={stepNum}>1</span> Connect Shopify — the long version</>}>
         <p style={{ color: 'var(--text-secondary)', fontSize: '14px', marginBottom: '16px' }}>
           Inventory Intel uses Shopify's Admin REST API with a custom/private app access token to pull your
           product catalog, historical orders (up to 365 days), and real-time inventory levels.
@@ -439,6 +441,7 @@ export default function Setup() {
           LOG_LEVEL=INFO
         </div>
       </Accordion>
+      <DangerZone />
     </div>
   )
 }

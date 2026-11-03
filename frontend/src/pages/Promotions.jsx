@@ -2,6 +2,19 @@ import { useState, useEffect } from 'react'
 import { getPromotions, createPromotion, deletePromotion } from '../services/api'
 import { thStyle, tdStyle } from '../components/shared/tableStyles'
 
+function promoTone(promo) {
+  const now = Date.now()
+  const start = promo.start_date ? new Date(promo.start_date).getTime() : NaN
+  const end = promo.end_date ? new Date(promo.end_date).getTime() : NaN
+  if (Number.isFinite(start) && now < start) {
+    return { label: 'UPCOMING', bg: 'var(--info-bg)', color: '#1e3a8a' }
+  }
+  if (Number.isFinite(start) && Number.isFinite(end) && start <= now && now <= end) {
+    return { label: 'ACTIVE', bg: 'var(--success-bg)', color: '#166534' }
+  }
+  return { label: 'ENDED', bg: 'var(--border-light)', color: 'var(--text-muted)' }
+}
+
 export default function Promotions() {
   const [promos, setPromos] = useState([])
   const [loading, setLoading] = useState(true)
@@ -143,10 +156,10 @@ export default function Promotions() {
                   <td style={tdStyle}>
                     <span style={{
                       padding: '3px 10px', borderRadius: '20px', fontSize: '11px', fontWeight: 700,
-                      background: p.is_active ? 'var(--success-bg)' : 'var(--border-light)',
-                      color: p.is_active ? 'var(--success)' : 'var(--text-muted)',
+                      background: promoTone(p).bg,
+                      color: promoTone(p).color,
                     }}>
-                      {p.is_active ? 'ACTIVE' : 'ENDED'}
+                      {promoTone(p).label}
                     </span>
                   </td>
                   <td style={{ ...tdStyle, fontWeight: 600 }}>{p.name}</td>

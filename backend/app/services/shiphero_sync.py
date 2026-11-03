@@ -1,22 +1,31 @@
 import asyncio
 import logging
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 
 import httpx
-from app.config import get_settings
+
 from app.database import async_session, get_upsert
 from app.models.models import InventorySnapshot
+from app.timeutil import utcnow_naive
 
 upsert = get_upsert()
 
 logger = logging.getLogger(__name__)
-settings = get_settings()
 
 GRAPHQL_URL = "https://public-api.shiphero.com/graphql"
-HEADERS = {
-    "Authorization": f"Bearer {settings.shiphero_api_token}",
-    "Content-Type": "application/json",
-}
+# (workspace_id, access token). workspace_id 0 means "read only, do not write".
+_sync_ctx: ContextVar[tuple[int, str] | None] = ContextVar("shiphero_sync_ctx", default=None)
+
+
+def _headers() -> dict:
+    current = _sync_ctx.get()
+    if current is None:
+        raise RuntimeError("ShipHero call was started without a token")
+    return {
+        "Authorization": f"Bearer {current[1]}",
+        "Content-Type": "application/json",
+    }
 TIMEOUT = 60
 MAX_RETRIES = 5
 BASE_BACKOFF = 1.0  # seconds
@@ -26,14 +35,14 @@ async def _graphql_request(
     query: str, variables: dict | None = None, client: httpx.AsyncClient | None = None
 ) -> dict:
     """Execute a GraphQL request against ShipHero API with retry + exponential backoff."""
-    payload = {"query": query}
+    payload: dict[str, object] = {"query": query}
     if variables:
         payload["variables"] = variables
 
     async def _do(c: httpx.AsyncClient):
         for attempt in range(MAX_RETRIES):
             try:
-                resp = await c.post(GRAPHQL_URL, headers=HEADERS, json=payload)
+                resp = await c.post(GRAPHQL_URL, headers=_headers(), json=payload)
 
                 if resp.status_code == 429:
                     retry_after = resp.headers.get("Retry-After")
@@ -202,7 +211,7 @@ async def fetch_inventory() -> list[dict]:
 
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
         while True:
-            variables = {"after": cursor} if cursor else {}
+            variables: dict[str, str] = {"after": cursor} if cursor else {}
             data = await _graphql_request(INVENTORY_QUERY, variables, client=client)
 
             inventory = data.get("inventory", {}).get("data", {})
@@ -240,7 +249,7 @@ async def fetch_open_purchase_orders() -> list[dict]:
 
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
         while True:
-            variables = {"after": cursor} if cursor else {}
+            variables: dict[str, str] = {"after": cursor} if cursor else {}
             data = await _graphql_request(PURCHASE_ORDERS_QUERY, variables, client=client)
 
             pos = data.get("purchase_orders", {}).get("data", {})
@@ -321,12 +330,16 @@ async def sync_inventory() -> int:
                 continue
             wh_id = item.get("warehouse_id", "default")
             snapshot_id = f"shiphero-{sku}-{wh_id}"
-            on_hand = _safe_int(item.get("on_hand"))
-            allocated = _safe_int(item.get("allocated"))
-            available = _safe_int(item.get("available"))
+            current = _sync_ctx.get()
+            if current is None:
+                raise RuntimeError("ShipHero sync was started without a workspace")
+            on_hand = max(_safe_int(item.get("on_hand")), 0)
+            allocated = max(_safe_int(item.get("allocated")), 0)
+            available = max(_safe_int(item.get("available")), 0)
             stmt = (
                 upsert(InventorySnapshot)
                 .values(
+                    workspace_id=current[0],
                     snapshot_id=snapshot_id,
                     sku=sku,
                     quantity_on_hand=on_hand,
@@ -334,14 +347,16 @@ async def sync_inventory() -> int:
                     quantity_available=available,
                     warehouse=item.get("warehouse", ""),
                     source="shiphero",
+                    recorded_at=utcnow_naive(),
                 )
                 .on_conflict_do_update(
-                    index_elements=["snapshot_id"],
+                    index_elements=["workspace_id", "snapshot_id"],
                     set_={
                         "quantity_on_hand": on_hand,
                         "quantity_allocated": allocated,
                         "quantity_available": available,
                         "warehouse": item.get("warehouse", ""),
+                        "recorded_at": utcnow_naive(),
                     },
                 )
             )
@@ -353,13 +368,29 @@ async def sync_inventory() -> int:
     return count
 
 
-async def full_sync() -> dict:
-    """Run full ShipHero sync."""
-    inventory_count = await sync_inventory()
-    purchase_orders = await fetch_open_purchase_orders()
-    adjustments = await fetch_recent_adjustments()
-    return {
-        "inventory_synced": inventory_count,
-        "open_purchase_orders": len(purchase_orders),
-        "recent_adjustments": len(adjustments),
-    }
+async def _with_token(workspace_id: int, token: str, fn):
+    handle = _sync_ctx.set((workspace_id, token))
+    try:
+        return await fn()
+    finally:
+        _sync_ctx.reset(handle)
+
+
+async def full_sync(workspace_id: int, token: str) -> dict:
+    """Run full ShipHero sync for one workspace. Read queries only."""
+
+    async def _run():
+        inventory_count = await sync_inventory()
+        purchase_orders = await fetch_open_purchase_orders()
+        adjustments = await fetch_recent_adjustments()
+        return {
+            "inventory_synced": inventory_count,
+            "open_purchase_orders": len(purchase_orders),
+            "recent_adjustments": len(adjustments),
+        }
+
+    return await _with_token(workspace_id, token, _run)
+
+
+async def open_purchase_orders(token: str) -> list[dict]:
+    return await _with_token(0, token, fetch_open_purchase_orders)

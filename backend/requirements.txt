@@ -2,6 +2,8 @@ fastapi
 uvicorn[standard]
 sqlalchemy[asyncio]
 aiosqlite
+asyncpg
+psycopg[binary]
 alembic
 pydantic
 pydantic-settings
@@ -9,5 +11,10 @@ httpx
 pandas
 statsmodels
 numpy
+scikit-learn
 apscheduler
 python-dotenv
+cryptography
+PyJWT
+bcrypt
+fpdf2

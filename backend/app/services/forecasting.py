@@ -1,21 +1,31 @@
+"""Load daily sales for one workspace and run the forecast portfolio."""
+
+from __future__ import annotations
+
+import asyncio
 import logging
 from collections import defaultdict
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from dataclasses import asdict, dataclass
+from datetime import timedelta
 
 import numpy as np
 import pandas as pd
-from sqlalchemy import select, and_, func
-from statsmodels.tsa.holtwinters import ExponentialSmoothing
+from sqlalchemy import and_, func, select
 
-from app.database import async_session, get_upsert
-from app.models.models import OrderLineItem, Order, ReorderRule, Product, InventorySnapshot
+from app.database import async_session
+from app.models.models import Order, OrderLineItem, Product, PromotionalPeriod, ReorderRule
+from app.services.forecast_engine import SkuForecast, promo_uplift_factor, run_portfolio
+from app.services.reorder import compute_reorder
+from app.services.stock import summed_stock
+from app.sqlutil import day_key
+from app.timeutil import utcnow_naive
 
 logger = logging.getLogger(__name__)
 
-# In-memory forecast cache
-_forecast_cache: dict = {"data": [], "expires": None}
 CACHE_TTL_MINUTES = 30
+_cache: dict[int, dict] = {}
+_inflight: dict[int, asyncio.Task] = {}
+_lock = asyncio.Lock()
 
 
 @dataclass
@@ -29,7 +39,15 @@ class SKUForecast:
     forecast_30d: float
     forecast_60d: float
     forecast_90d: float
+    confidence_low_30: float
+    confidence_high_30: float
+    confidence_low_90: float
+    confidence_high_90: float
     has_seasonality: bool
+    intermittent: bool
+    model: str
+    model_mase: float | None
+    selection: str
     reorder_point: int
     current_stock: int
     below_reorder_point: bool
@@ -39,355 +57,260 @@ class SKUForecast:
     safety_stock: int
 
 
-async def _get_daily_sales(session, sku: str, days: int = 365) -> pd.DataFrame:
-    """Get daily sales aggregation for a SKU."""
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+def invalidate_forecast_cache(workspace_id: int | None = None) -> None:
+    if workspace_id is None:
+        _cache.clear()
+    else:
+        _cache.pop(workspace_id, None)
 
-    result = await session.execute(
-        select(
-            func.strftime('%Y-%m-%d', Order.created_at).label("sale_date"),
-            func.sum(OrderLineItem.quantity).label("total_qty"),
-        )
-        .join(Order, OrderLineItem.order_id == Order.order_id)
-        .where(
-            and_(
-                OrderLineItem.sku == sku,
+
+def _velocity(values: np.ndarray, days: int) -> float:
+    if len(values) == 0:
+        return 0.0
+    window = values[-days:] if len(values) >= days else values
+    return round(float(np.mean(window)), 2)
+
+
+async def _load_inputs(workspace_id: int):
+    now = utcnow_naive()
+    cutoff = now - timedelta(days=370)
+    async with async_session() as session:
+        day = day_key(Order.created_at)
+        result = await session.execute(
+            select(
+                OrderLineItem.sku,
+                day.label("sale_date"),
+                func.sum(OrderLineItem.quantity).label("qty"),
+            )
+            .join(
+                Order,
+                and_(
+                    Order.workspace_id == OrderLineItem.workspace_id,
+                    Order.order_id == OrderLineItem.order_id,
+                ),
+            )
+            .where(
+                OrderLineItem.workspace_id == workspace_id,
                 Order.created_at >= cutoff,
             )
+            .group_by(OrderLineItem.sku, day)
         )
-        .group_by(func.strftime('%Y-%m-%d', Order.created_at))
-        .order_by(func.strftime('%Y-%m-%d', Order.created_at))
-    )
-    rows = result.all()
-
-    if not rows:
-        return pd.DataFrame(columns=["date", "quantity"])
-
-    df = pd.DataFrame(rows, columns=["date", "quantity"])
-    df["date"] = pd.to_datetime(df["date"])
-
-    # Fill missing days with 0
-    date_range = pd.date_range(start=df["date"].min(), end=df["date"].max(), freq="D")
-    df = df.set_index("date").reindex(date_range, fill_value=0).reset_index()
-    df.columns = ["date", "quantity"]
-    return df
-
-
-def _remove_outliers(series: pd.Series, z_threshold: float = 3.0) -> pd.Series:
-    """Remove outliers using z-score method."""
-    if len(series) < 10:
-        return series.astype(float)
-    mean = series.mean()
-    std = series.std()
-    if std == 0:
-        return series.astype(float)
-    z_scores = np.abs((series - mean) / std)
-    cleaned = series.astype(float).copy()
-    cleaned[z_scores > z_threshold] = mean
-    return cleaned
-
-
-def _calculate_velocity(df: pd.DataFrame, days: int) -> float:
-    """Calculate average daily velocity over N most recent days."""
-    if df.empty:
-        return 0.0
-    recent = df.tail(days)
-    return round(recent["quantity"].mean(), 2)
-
-
-def _detect_seasonality(df: pd.DataFrame) -> bool:
-    """Simple seasonality detection using autocorrelation."""
-    if len(df) < 60:
-        return False
-    series = df["quantity"]
-    if series.std() == 0:
-        return False
-    autocorr_7 = series.autocorr(lag=7)
-    autocorr_30 = series.autocorr(lag=30)
-    return bool(
-        (pd.notna(autocorr_7) and autocorr_7 > 0.3)
-        or (pd.notna(autocorr_30) and autocorr_30 > 0.3)
-    )
-
-
-def _exponential_smoothing_forecast(
-    df: pd.DataFrame, periods: int, seasonal: bool
-) -> float:
-    """Apply exponential smoothing and forecast N days ahead."""
-    series = _remove_outliers(df["quantity"])
-
-    if len(series) < 14:
-        mean_val = series.mean()
-        if pd.isna(mean_val):
-            return 0.0
-        return round(mean_val * periods, 0)
-
-    try:
-        if seasonal and len(series) >= 60:
-            model = ExponentialSmoothing(
-                series,
-                trend="add",
-                seasonal="add",
-                seasonal_periods=7,
-                initialization_method="estimated",
-            )
-        else:
-            model = ExponentialSmoothing(
-                series,
-                trend="add",
-                initialization_method="estimated",
-            )
-        fitted = model.fit(optimized=True)
-        forecast = fitted.forecast(periods)
-        return round(max(forecast.sum(), 0), 0)
-    except Exception as e:
-        logger.warning(f"Exponential smoothing failed, falling back to average: {e}")
-        mean_val = series.mean()
-        if pd.isna(mean_val):
-            return 0.0
-        return round(mean_val * periods, 0)
-
-
-async def generate_forecast(session, sku: str) -> SKUForecast | None:
-    """Generate a complete forecast for a single SKU (uses shared session)."""
-    df = await _get_daily_sales(session, sku, days=365)
-    if df.empty:
-        return None
-
-    # Get product title
-    product = await session.execute(
-        select(Product.title).where(Product.sku == sku)
-    )
-    title = product.scalar_one_or_none() or "Unknown"
-
-    # Get reorder rules
-    rule_result = await session.execute(
-        select(ReorderRule).where(ReorderRule.sku == sku)
-    )
-    rule = rule_result.scalar_one_or_none()
-
-    # Get current stock from latest ShipHero snapshot
-    stock_result = await session.execute(
-        select(func.sum(InventorySnapshot.quantity_available))
-        .where(
-            and_(
-                InventorySnapshot.sku == sku,
-                InventorySnapshot.source == "shiphero",
-            )
+        rows = result.all()
+        titles_result = await session.execute(
+            select(Product.sku, Product.title, Product.parent_sku).where(Product.workspace_id == workspace_id)
         )
+        titles = {}
+        parents = {}
+        for sku, title, parent in titles_result.all():
+            titles[sku] = title or "Unknown"
+            if parent:
+                parents[sku] = parent
+        rules_result = await session.execute(
+            select(ReorderRule).where(ReorderRule.workspace_id == workspace_id)
+        )
+        rules = {rule.sku: rule for rule in rules_result.scalars().all()}
+        stock = await summed_stock(session, workspace_id, "shiphero")
+        promos_result = await session.execute(
+            select(PromotionalPeriod).where(PromotionalPeriod.workspace_id == workspace_id)
+        )
+        promos = list(promos_result.scalars().all())
+
+    grouped: dict[str, list] = defaultdict(list)
+    for sku, sale_date, qty in rows:
+        grouped[sku].append((pd.to_datetime(sale_date), float(qty or 0)))
+
+    end = pd.Timestamp(now.date())
+    index = pd.date_range(end=end, periods=365, freq="D")
+    future_index = pd.date_range(start=end + pd.Timedelta(days=1), periods=90, freq="D")
+    series: dict[str, np.ndarray] = {}
+    for sku, points in grouped.items():
+        frame = pd.DataFrame(points, columns=["date", "quantity"]).groupby("date", as_index=True).sum()
+        aligned = frame.reindex(index, fill_value=0.0)["quantity"].to_numpy(dtype=float)
+        series[sku] = aligned
+
+    def uplift_for(dates: pd.DatetimeIndex) -> np.ndarray:
+        factors = np.ones(len(dates))
+        for promo in promos:
+            start = pd.Timestamp(promo.start_date).normalize()
+            stop = pd.Timestamp(promo.end_date).normalize()
+            factor = promo_uplift_factor(float(promo.discount_pct or 0))
+            mask = (dates >= start) & (dates <= stop)
+            factors[mask] = np.maximum(factors[mask], factor)
+        return factors
+
+    # The same calendar applies to every SKU. Promotions in this app are
+    # store-wide, which matches how the seeder and the promotions screen work.
+    history_uplift = uplift_for(index)
+    future = uplift_for(future_index)
+    uplift = {sku: history_uplift.copy() for sku in series}
+    future_uplift = {sku: future.copy() for sku in series}
+    return series, titles, rules, stock, int(index[0].dayofweek), uplift, future_uplift, parents
+
+
+def _to_row(sku: str, title: str, fc: SkuForecast, rule, stock_row: dict | None) -> SKUForecast:
+    current = int((stock_row or {}).get("available") or 0)
+    current = max(current, 0)
+    lead = rule.lead_time_days if rule else 14
+    safety = rule.safety_stock if rule else 0
+    moq = rule.reorder_quantity if rule else None
+    manual_point = rule.reorder_point if rule else None
+    p30, lo30, hi30 = fc.sum_between(0, 30)
+    p60, _, _ = fc.sum_between(0, 60)
+    p90, lo90, hi90 = fc.sum_between(0, 90)
+    daily_model = p30 / 30.0 if p30 > 0 else 0.0
+    plan = compute_reorder(
+        daily_demand=daily_model,
+        current_stock=current,
+        lead_time_days=lead,
+        safety_stock=safety,
+        moq=moq,
+        manual_reorder_point=manual_point,
     )
-    current_stock = stock_result.scalar_one() or 0
-
-    lead_time = rule.lead_time_days if rule else 14
-    safety_stock = rule.safety_stock if rule else 0
-
-    return _generate_forecast_from_data(sku, title, df, rule, current_stock, lead_time, safety_stock)
-
-
-def _generate_forecast_from_data(
-    sku: str,
-    title: str,
-    df: pd.DataFrame,
-    rule,
-    current_stock: int,
-    lead_time: int,
-    safety_stock: int,
-) -> SKUForecast:
-    """Pure computation — build a SKUForecast from pre-fetched data (no DB queries)."""
-    velocity_30d = _calculate_velocity(df, 30)
-    velocity_90d = _calculate_velocity(df, 90)
-    velocity_365d = _calculate_velocity(df, 365)
-
-    # Rolling 30-day average
-    if len(df) >= 30:
-        rolling = df["quantity"].rolling(window=30).mean()
-        last_val = rolling.iloc[-1]
-        rolling_30d = round(last_val, 2) if pd.notna(last_val) else velocity_30d
-    else:
-        rolling_30d = velocity_30d
-
-    has_seasonality = _detect_seasonality(df)
-
-    forecast_30d = _exponential_smoothing_forecast(df, 30, has_seasonality)
-    forecast_60d = _exponential_smoothing_forecast(df, 60, has_seasonality)
-    forecast_90d = _exponential_smoothing_forecast(df, 90, has_seasonality)
-
-    # Reorder point = (avg daily sales x lead_time_days) + safety_stock
-    reorder_point = int(np.ceil(rolling_30d * lead_time) + safety_stock)
-    if rule:
-        reorder_point = max(reorder_point, rule.reorder_point)
-
-    below_reorder = current_stock <= reorder_point
-
-    # Suggested reorder qty: weeks_of_supply_target (default 8 weeks)
-    weeks_target = 8
-    suggested_qty = max(
-        int(np.ceil(rolling_30d * 7 * weeks_target)) - current_stock, 0
-    )
-    if rule and rule.reorder_quantity:
-        suggested_qty = max(suggested_qty, rule.reorder_quantity)
-
-    days_remaining = (
-        round(current_stock / rolling_30d, 1) if rolling_30d > 0 else None
-    )
-
     return SKUForecast(
         sku=sku,
         title=title,
-        avg_daily_velocity_30d=velocity_30d,
-        avg_daily_velocity_90d=velocity_90d,
-        avg_daily_velocity_365d=velocity_365d,
-        rolling_30d_avg=rolling_30d,
-        forecast_30d=forecast_30d,
-        forecast_60d=forecast_60d,
-        forecast_90d=forecast_90d,
-        has_seasonality=has_seasonality,
-        reorder_point=reorder_point,
-        current_stock=current_stock,
-        below_reorder_point=below_reorder,
-        suggested_reorder_qty=suggested_qty,
-        days_of_stock_remaining=days_remaining,
-        lead_time_days=lead_time,
-        safety_stock=safety_stock,
+        avg_daily_velocity_30d=0.0,
+        avg_daily_velocity_90d=0.0,
+        avg_daily_velocity_365d=0.0,
+        rolling_30d_avg=round(daily_model, 2),
+        forecast_30d=round(p30, 0),
+        forecast_60d=round(p60, 0),
+        forecast_90d=round(p90, 0),
+        confidence_low_30=round(lo30, 0),
+        confidence_high_30=round(hi30, 0),
+        confidence_low_90=round(lo90, 0),
+        confidence_high_90=round(hi90, 0),
+        has_seasonality=fc.has_seasonality,
+        intermittent=fc.intermittent,
+        model=fc.model,
+        model_mase=round(fc.mase, 3) if fc.mase < 100 else None,
+        selection=fc.selection,
+        reorder_point=plan["reorder_point"],
+        current_stock=current,
+        below_reorder_point=plan["below_reorder_point"],
+        suggested_reorder_qty=plan["suggested_reorder_qty"],
+        days_of_stock_remaining=plan["days_of_stock_remaining"],
+        lead_time_days=lead,
+        safety_stock=safety,
     )
 
 
-# ---- Batch query helpers for generate_all_forecasts ----
+async def _build(workspace_id: int) -> tuple[list[SKUForecast], dict]:
+    series, titles, rules, stock, start_dow, uplift, future, parents = await _load_inputs(workspace_id)
+    if not series:
+        report = {
+            "global_winner": None,
+            "baseline_ets_mase": None,
+            "selected_mase": None,
+            "sku_count": 0,
+            "per_sku_wins": 0,
+            "global_wins": 0,
+        }
+        return [], report
 
-async def _get_all_daily_sales(session, days: int = 365) -> dict[str, pd.DataFrame]:
-    """Single query for ALL SKU daily sales, grouped into per-SKU DataFrames."""
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-
-    result = await session.execute(
-        select(
-            OrderLineItem.sku,
-            func.strftime('%Y-%m-%d', Order.created_at).label("sale_date"),
-            func.sum(OrderLineItem.quantity).label("total_qty"),
+    def _run():
+        return run_portfolio(
+            series,
+            start_dow=start_dow,
+            uplift=uplift,
+            future_uplift=future,
+            parents=parents,
         )
-        .join(Order, OrderLineItem.order_id == Order.order_id)
-        .where(Order.created_at >= cutoff)
-        .group_by(OrderLineItem.sku, func.strftime('%Y-%m-%d', Order.created_at))
-        .order_by(OrderLineItem.sku, func.strftime('%Y-%m-%d', Order.created_at))
-    )
-    rows = result.all()
 
-    # Group rows by SKU
-    sku_rows: dict[str, list] = defaultdict(list)
-    for sku, sale_date, total_qty in rows:
-        sku_rows[sku].append((sale_date, total_qty))
-
-    # Build per-SKU DataFrames with gap-filling
-    sku_dfs: dict[str, pd.DataFrame] = {}
-    for sku, data in sku_rows.items():
-        df = pd.DataFrame(data, columns=["date", "quantity"])
-        df["date"] = pd.to_datetime(df["date"])
-        date_range = pd.date_range(start=df["date"].min(), end=df["date"].max(), freq="D")
-        df = df.set_index("date").reindex(date_range, fill_value=0).reset_index()
-        df.columns = ["date", "quantity"]
-        sku_dfs[sku] = df
-
-    return sku_dfs
-
-
-async def _get_all_titles(session) -> dict[str, str]:
-    """All product titles in one query."""
-    result = await session.execute(select(Product.sku, Product.title))
-    return {sku: (title or "Unknown") for sku, title in result.all()}
-
-
-async def _get_all_reorder_rules(session) -> dict[str, ReorderRule]:
-    """All reorder rules in one query."""
-    result = await session.execute(select(ReorderRule))
-    return {rule.sku: rule for rule in result.scalars().all()}
-
-
-async def _get_all_stock(session) -> dict[str, int]:
-    """Latest inventory snapshot per SKU in one query."""
-    result = await session.execute(
-        select(
-            InventorySnapshot.sku,
-            func.sum(InventorySnapshot.quantity_available).label("total_stock"),
-        )
-        .where(InventorySnapshot.source == "shiphero")
-        .group_by(InventorySnapshot.sku)
-    )
-    return {sku: (stock or 0) for sku, stock in result.all()}
-
-
-async def generate_all_forecasts() -> list[SKUForecast]:
-    """Generate forecasts for all active SKUs (cached). Uses batch queries."""
-    now = datetime.now(timezone.utc)
-    if _forecast_cache["expires"] and now < _forecast_cache["expires"] and _forecast_cache["data"]:
-        return _forecast_cache["data"]
-
-    async with async_session() as session:
-        # 4 batch queries instead of 4N+1 per-SKU queries
-        sku_dfs = await _get_all_daily_sales(session)
-        titles = await _get_all_titles(session)
-        rules = await _get_all_reorder_rules(session)
-        stock = await _get_all_stock(session)
-
-    # Get the union of all SKUs that have sales data
-    skus_with_sales = set(sku_dfs.keys())
-
-    forecasts = []
-    for sku in skus_with_sales:
-        df = sku_dfs[sku]
-        if df.empty:
-            continue
-
-        title = titles.get(sku, "Unknown")
-        rule = rules.get(sku)
-        current_stock = stock.get(sku, 0)
-        lead_time = rule.lead_time_days if rule else 14
-        safety_stock_val = rule.safety_stock if rule else 0
-
-        forecast = _generate_forecast_from_data(
-            sku, title, df, rule, current_stock, lead_time, safety_stock_val
-        )
-        forecasts.append(forecast)
-
-    _forecast_cache["data"] = forecasts
-    _forecast_cache["expires"] = now + timedelta(minutes=CACHE_TTL_MINUTES)
-
+    portfolio = await asyncio.to_thread(_run)
+    rows = []
+    for sku, fc in portfolio.skus.items():
+        history = series[sku]
+        row = _to_row(sku, titles.get(sku, "Unknown"), fc, rules.get(sku), stock.get(sku))
+        row.avg_daily_velocity_30d = _velocity(history, 30)
+        row.avg_daily_velocity_90d = _velocity(history, 90)
+        row.avg_daily_velocity_365d = _velocity(history, 365)
+        row.rolling_30d_avg = row.avg_daily_velocity_30d
+        rows.append(row)
+    rows.sort(key=lambda r: r.sku)
+    report = portfolio.report()
     logger.info(
-        f"Generated forecasts for {len(forecasts)} SKUs, "
-        f"{sum(1 for f in forecasts if f.below_reorder_point)} below reorder point"
+        "Forecasts for workspace %s: %s SKUs, baseline ETS MASE %s, selected MASE %s, winner %s",
+        workspace_id,
+        len(rows),
+        report.get("baseline_ets_mase"),
+        report.get("selected_mase"),
+        report.get("global_winner"),
     )
-    return forecasts
+    return rows, report
 
 
-async def update_reorder_rules() -> int:
-    """Update reorder rules from forecasts (called by scheduler only, not GET requests)."""
-    forecasts = await generate_all_forecasts()
+async def generate_all_forecasts(workspace_id: int) -> tuple[list[SKUForecast], dict]:
+    now = utcnow_naive()
+    cached = _cache.get(workspace_id)
+    if cached and cached["expires"] > now:
+        return cached["rows"], cached["report"]
 
+    async with _lock:
+        cached = _cache.get(workspace_id)
+        if cached and cached["expires"] > utcnow_naive():
+            return cached["rows"], cached["report"]
+        task = _inflight.get(workspace_id)
+        if task is None or task.done():
+            task = asyncio.create_task(_build(workspace_id))
+            _inflight[workspace_id] = task
+    try:
+        rows, report = await task
+    finally:
+        if _inflight.get(workspace_id) is task and task.done():
+            _inflight.pop(workspace_id, None)
+    _cache[workspace_id] = {
+        "rows": rows,
+        "report": report,
+        "expires": utcnow_naive() + timedelta(minutes=CACHE_TTL_MINUTES),
+    }
+    return rows, report
+
+
+async def get_reorder_alerts(workspace_id: int) -> list[SKUForecast]:
+    rows, _ = await generate_all_forecasts(workspace_id)
+    return [row for row in rows if row.below_reorder_point]
+
+
+def forecast_to_dict(row: SKUForecast) -> dict:
+    return asdict(row)
+
+
+async def update_reorder_points(workspace_id: int) -> int:
+    """Refresh stored reorder points from the latest forecast.
+
+    Does not touch reorder_quantity. That column is the supplier minimum
+    the buyer set, not a forecast output.
+    """
+    from app.database import get_upsert
+
+    rows, _ = await generate_all_forecasts(workspace_id)
     upsert = get_upsert()
     async with async_session() as session:
-        for f in forecasts:
+        existing = await session.execute(
+            select(ReorderRule.sku).where(ReorderRule.workspace_id == workspace_id)
+        )
+        known = {sku for (sku,) in existing.all()}
+        updated = 0
+        for row in rows:
+            if row.sku not in known:
+                continue
             stmt = (
                 upsert(ReorderRule)
                 .values(
-                    sku=f.sku,
-                    reorder_point=f.reorder_point,
-                    reorder_quantity=f.suggested_reorder_qty,
-                    lead_time_days=f.lead_time_days,
-                    safety_stock=f.safety_stock,
+                    workspace_id=workspace_id,
+                    sku=row.sku,
+                    reorder_point=row.reorder_point,
+                    reorder_quantity=1,
+                    lead_time_days=row.lead_time_days,
+                    safety_stock=row.safety_stock,
                 )
                 .on_conflict_do_update(
-                    index_elements=["sku"],
-                    set_={
-                        "reorder_point": f.reorder_point,
-                        "reorder_quantity": f.suggested_reorder_qty,
-                    },
+                    index_elements=["workspace_id", "sku"],
+                    set_={"reorder_point": row.reorder_point},
                 )
             )
             await session.execute(stmt)
+            updated += 1
         await session.commit()
-
-    return len(forecasts)
-
-
-async def get_reorder_alerts() -> list[SKUForecast]:
-    """Return only SKUs below their reorder point."""
-    forecasts = await generate_all_forecasts()
-    return [f for f in forecasts if f.below_reorder_point]
+    return updated

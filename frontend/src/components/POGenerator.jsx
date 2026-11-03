@@ -23,7 +23,8 @@ export default function POGenerator() {
         .then(r => {
           const data = r.data
           setOpenPOs(data.items || [])
-          if (data.error) setPOError(data.error)
+          if (data.notice) setPOError(data.notice)
+          else if (data.error) setPOError(data.error)
         })
         .catch(err => {
           setOpenPOs([])
@@ -89,7 +90,7 @@ export default function POGenerator() {
             color: tab === t ? '#fff' : 'var(--text-secondary)',
             fontSize: '13px', fontWeight: 600, transition: 'all 0.15s',
           }}>
-            {t === 'suggestions' ? `Suggestions (${suggestions.length})` : `Open POs (${openPOs.length})`}
+            {t === 'suggestions' ? `What to buy (${suggestions.length})` : `Already on order (${openPOs.length})`}
           </button>
         ))}
       </div>
@@ -120,6 +121,7 @@ export default function POGenerator() {
               }}>
                 <label style={{ fontSize: '13px', color: 'var(--text-secondary)', display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
                   <input type="checkbox" checked={selected.size === suggestions.length} onChange={selectAll}
+                    aria-label="Select all suggested buys"
                     style={{ accentColor: 'var(--accent)', width: 16, height: 16 }} />
                   Select all ({selected.size} selected)
                 </label>
@@ -153,6 +155,7 @@ export default function POGenerator() {
                         <tr key={s.sku} style={{ background: i % 2 === 0 ? 'var(--bg-white)' : 'var(--bg-primary)' }}>
                           <td style={tdStyle}>
                             <input type="checkbox" checked={selected.has(s.sku)} onChange={() => toggleSelect(s.sku)}
+                              aria-label={`Select ${s.sku}`}
                               style={{ accentColor: 'var(--accent)', width: 16, height: 16 }} />
                           </td>
                           <td style={tdStyle}>
@@ -185,8 +188,8 @@ export default function POGenerator() {
         }}>
           {poError ? (
             <div style={{ padding: '40px', textAlign: 'center' }}>
-              <div style={{ color: 'var(--danger)', fontWeight: 600, marginBottom: 6 }}>Error loading purchase orders</div>
-              <div style={{ color: 'var(--text-muted)', fontSize: '12px' }}>{poError}</div>
+              <div style={{ fontWeight: 600, marginBottom: 6 }}>No live purchase orders</div>
+              <div style={{ color: 'var(--text-secondary)', fontSize: '14px' }}>{poError}</div>
             </div>
           ) : openPOs.length === 0 ? (
             <div style={{ padding: '40px', textAlign: 'center', color: 'var(--text-muted)' }}>

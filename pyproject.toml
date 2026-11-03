@@ -1,0 +1,26 @@
+[tool.ruff]
+line-length = 120
+src = ["backend"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B"]
+# B008: FastAPI uses Depends() in argument defaults.
+# B904: HTTP errors are deliberately detached from internal exceptions.
+ignore = ["E501", "B008", "B904"]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+check_untyped_defs = true
+warn_unused_ignores = false
+warn_return_any = false
+disallow_untyped_defs = false
+follow_imports = "silent"
+exclude = ["backend/alembic", "backend/.venv"]
+mypy_path = "backend"
+explicit_package_bases = true
+namespace_packages = true
+
+[[tool.mypy.overrides]]
+module = ["tests.*", "seed"]
+ignore_errors = true

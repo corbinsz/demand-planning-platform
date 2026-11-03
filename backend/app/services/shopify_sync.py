@@ -1,26 +1,42 @@
 import asyncio
 import logging
 import re
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 
 import httpx
-from sqlalchemy import select
 
 from app.config import get_settings
 from app.database import async_session, get_upsert
-from app.models.models import Product, Order, OrderLineItem, InventorySnapshot
+from app.models.models import InventorySnapshot, Order, OrderLineItem, Product
+from app.timeutil import utcnow_naive
 
 upsert = get_upsert()
 
 logger = logging.getLogger(__name__)
-settings = get_settings()
 
-BASE_URL = f"https://{settings.shopify_store_domain}/admin/api/2024-01"
-HEADERS = {
-    "X-Shopify-Access-Token": settings.shopify_access_token,
-    "Content-Type": "application/json",
-}
+# (workspace_id, shop domain, access token) for the sync currently running.
+_sync_ctx: ContextVar[tuple[int, str, str] | None] = ContextVar("shopify_sync_ctx", default=None)
+
+
+def _ctx() -> tuple[int, str, str]:
+    current = _sync_ctx.get()
+    if current is None:
+        raise RuntimeError("Shopify sync was started without a workspace")
+    return current
+
+
+def _base_url() -> str:
+    settings = get_settings()
+    return f"https://{_ctx()[1]}/admin/api/{settings.shopify_api_version}"
+
+
+def _headers() -> dict:
+    return {
+        "X-Shopify-Access-Token": _ctx()[2],
+        "Content-Type": "application/json",
+    }
 PAGE_LIMIT = 250
 MAX_RETRIES = 5
 
@@ -57,9 +73,9 @@ async def _request_with_backoff(
 async def fetch_all_products() -> list[dict]:
     """Fetch all products and variants with SKUs from Shopify."""
     products = []
-    url = f"{BASE_URL}/products.json?limit={PAGE_LIMIT}"
+    url: str | None = f"{_base_url()}/products.json?limit={PAGE_LIMIT}"
 
-    async with httpx.AsyncClient(headers=HEADERS, timeout=30) as client:
+    async with httpx.AsyncClient(headers=_headers(), timeout=30) as client:
         while url:
             resp = await _request_with_backoff(client, "GET", url)
             data = resp.json()
@@ -79,12 +95,12 @@ async def fetch_orders(days: int = 365) -> list[dict]:
     """Fetch orders from the last N days with line items."""
     orders = []
     since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-    url = (
-        f"{BASE_URL}/orders.json?limit={PAGE_LIMIT}&status=any"
+    url: str | None = (
+        f"{_base_url()}/orders.json?limit={PAGE_LIMIT}&status=any"
         f"&created_at_min={since}&fields=id,name,created_at,total_price,line_items"
     )
 
-    async with httpx.AsyncClient(headers=HEADERS, timeout=30) as client:
+    async with httpx.AsyncClient(headers=_headers(), timeout=30) as client:
         while url:
             resp = await _request_with_backoff(client, "GET", url)
             data = resp.json()
@@ -103,14 +119,14 @@ async def fetch_inventory_levels() -> list[dict]:
     """Fetch current inventory levels per location."""
     # First get locations
     locations = []
-    async with httpx.AsyncClient(headers=HEADERS, timeout=30) as client:
-        resp = await _request_with_backoff(client, "GET", f"{BASE_URL}/locations.json")
+    async with httpx.AsyncClient(headers=_headers(), timeout=30) as client:
+        resp = await _request_with_backoff(client, "GET", f"{_base_url()}/locations.json")
         locations = resp.json().get("locations", [])
 
         levels = []
         for loc in locations:
-            url = (
-                f"{BASE_URL}/inventory_levels.json"
+            url: str | None = (
+                f"{_base_url()}/inventory_levels.json"
                 f"?location_ids={loc['id']}&limit={PAGE_LIMIT}"
             )
             while url:
@@ -139,15 +155,16 @@ async def sync_products() -> int:
                 stmt = (
                     upsert(Product)
                     .values(
+                        workspace_id=_ctx()[0],
                         sku=sku,
-                        title=product.get("title", ""),
+                        title=product.get("title", "") or sku,
                         variant_id=str(variant.get("id", "")),
                         shopify_id=str(product.get("id", "")),
                     )
                     .on_conflict_do_update(
-                        index_elements=["sku"],
+                        index_elements=["workspace_id", "sku"],
                         set_={
-                            "title": product.get("title", ""),
+                            "title": product.get("title", "") or sku,
                             "variant_id": str(variant.get("id", "")),
                             "shopify_id": str(product.get("id", "")),
                         },
@@ -192,13 +209,14 @@ async def sync_orders(days: int = 365) -> int:
             stmt = (
                 upsert(Order)
                 .values(
+                    workspace_id=_ctx()[0],
                     order_id=order_id,
                     shopify_order_id=order_id,
-                    created_at=created,
+                    created_at=created or utcnow_naive(),
                     total_price=total,
                 )
                 .on_conflict_do_update(
-                    index_elements=["order_id"],
+                    index_elements=["workspace_id", "order_id"],
                     set_={"total_price": total},
                 )
             )
@@ -210,19 +228,21 @@ async def sync_orders(days: int = 365) -> int:
                     continue
                 li_id = str(item["id"])
                 item_price = _parse_price(item.get("price"))
+                qty = max(int(item.get("quantity", 0) or 0), 0)
                 stmt = (
                     upsert(OrderLineItem)
                     .values(
+                        workspace_id=_ctx()[0],
                         line_item_id=li_id,
                         order_id=order_id,
                         sku=sku,
-                        quantity=int(item.get("quantity", 0)),
+                        quantity=qty,
                         price=item_price,
                     )
                     .on_conflict_do_update(
-                        index_elements=["line_item_id"],
+                        index_elements=["workspace_id", "line_item_id"],
                         set_={
-                            "quantity": int(item.get("quantity", 0)),
+                            "quantity": qty,
                             "price": item_price,
                         },
                     )
@@ -265,10 +285,11 @@ async def sync_inventory_levels() -> int:
                 skipped += 1
                 continue
             snapshot_id = f"shopify-{inv_item_id}-{level['location_id']}"
-            qty = int(level.get("available") or 0)
+            qty = max(int(level.get("available") or 0), 0)
             stmt = (
                 upsert(InventorySnapshot)
                 .values(
+                    workspace_id=_ctx()[0],
                     snapshot_id=snapshot_id,
                     sku=sku,
                     quantity_on_hand=qty,
@@ -276,12 +297,14 @@ async def sync_inventory_levels() -> int:
                     quantity_available=qty,
                     warehouse=level.get("location_name", "Unknown"),
                     source="shopify",
+                    recorded_at=utcnow_naive(),
                 )
                 .on_conflict_do_update(
-                    index_elements=["snapshot_id"],
+                    index_elements=["workspace_id", "snapshot_id"],
                     set_={
                         "quantity_on_hand": qty,
                         "quantity_available": qty,
+                        "recorded_at": utcnow_naive(),
                     },
                 )
             )
@@ -295,13 +318,17 @@ async def sync_inventory_levels() -> int:
     return count
 
 
-async def full_sync() -> dict:
-    """Run full Shopify sync: products, orders, inventory."""
-    products = await sync_products()
-    orders = await sync_orders()
-    inventory = await sync_inventory_levels()
-    return {
-        "products_synced": products,
-        "order_line_items_synced": orders,
-        "inventory_levels_synced": inventory,
-    }
+async def full_sync(workspace_id: int, domain: str, token: str) -> dict:
+    """Run full Shopify sync for one workspace. Read scopes only."""
+    handle = _sync_ctx.set((workspace_id, domain, token))
+    try:
+        products = await sync_products()
+        orders = await sync_orders()
+        inventory = await sync_inventory_levels()
+        return {
+            "products_synced": products,
+            "order_line_items_synced": orders,
+            "inventory_levels_synced": inventory,
+        }
+    finally:
+        _sync_ctx.reset(handle)

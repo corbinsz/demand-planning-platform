@@ -1,25 +1,34 @@
 """
-Seed the database with demo data modeled after a DTC fitness brand (Otishi-style).
+Seed a fictional brand, Northline Athletics, based in Salt Lake City.
 
-Run:  python -m seed
+Nothing here is a real customer's catalog. Run:  python -m seed
 """
 
 import asyncio
 import random
-import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
+from sqlalchemy import func, select, text
+
 from app.database import async_session, init_db
 from app.models.models import (
-    Product, Order, OrderLineItem, InventorySnapshot,
-    ReorderRule, PromotionalPeriod, JobLog,
+    InventorySnapshot,
+    JobLog,
+    Order,
+    OrderLineItem,
+    Product,
+    PromotionalPeriod,
+    ReorderRule,
+    User,
+    Workspace,
 )
+from app.security import hash_password
 
 random.seed(42)
 
 # ---------------------------------------------------------------------------
-# Product catalog — modeled after Otishi (DTC athletic / lifting brand)
+# Product catalog — fictional athletic brand. Not a real company.
 # ---------------------------------------------------------------------------
 
 SHOE_SIZES = [
@@ -54,11 +63,13 @@ APPAREL_COLORS = {
     "Orange":   "ORG",
 }
 
-WAREHOUSES = ["Primary - NJ", "West Coast - CA"]
+# Fictional brand ships from Utah. The second site is a overflow warehouse,
+# not a claim about where the software owner lives.
+WAREHOUSES = ["Salt Lake City, UT", "Las Vegas, NV"]
 
 
 def _build_catalog():
-    """Return list of product dicts mirroring a real Otishi-style catalog."""
+    """Return the fictional Northline Athletics catalog."""
     products = []
 
     # ---- THE OTISHI 2.0 (hero shoe, 4 colorways) ----
@@ -69,11 +80,11 @@ def _build_catalog():
         ("Petrified Sand", "PSD", [s for s in SHOE_SIZES if int(s[1]) >= 8]),
     ]
     for cw_name, cw_code, sizes in shoe_colorways:
-        parent = f"OT-20-{cw_code}"
+        parent = f"NL-20-{cw_code}"
         for size_label, size_code in sizes:
             products.append({
-                "sku": f"OT-20-{cw_code}-{size_code}",
-                "title": f'The Otishi 2.0 "{cw_name}" - {size_label}',
+                "sku": f"NL-20-{cw_code}-{size_code}",
+                "title": f'Northline Trainer "{cw_name}" - {size_label}',
                 "parent_sku": parent,
                 "cost_price": Decimal("28.00"),
                 "retail_price": Decimal("84.99"),
@@ -84,10 +95,10 @@ def _build_catalog():
 
     # ---- LIFTING CLUB TEE ----
     for color, cc in [("Obsidian", "OBS"), ("Brown", "BRN")]:
-        parent = "OT-LCT"
+        parent = "NL-LCT"
         for sz in APPAREL_SIZES:
             products.append({
-                "sku": f"OT-LCT-{cc}-{sz}",
+                "sku": f"NL-LCT-{cc}-{sz}",
                 "title": f"Lifting Club Tee - {color} / {sz}",
                 "parent_sku": parent,
                 "cost_price": Decimal("12.00"),
@@ -99,10 +110,10 @@ def _build_catalog():
 
     # ---- DEADLIFT UNIVERSITY SWEATS ----
     for color, cc in [("Black", "BLK"), ("Brown", "BRN")]:
-        parent = "OT-DUS"
+        parent = "NL-DUS"
         for sz in APPAREL_SIZES:
             products.append({
-                "sku": f"OT-DUS-{cc}-{sz}",
+                "sku": f"NL-DUS-{cc}-{sz}",
                 "title": f"Deadlift University Sweats - {color} / {sz}",
                 "parent_sku": parent,
                 "cost_price": Decimal("22.00"),
@@ -115,9 +126,9 @@ def _build_catalog():
     # ---- CREW SOCKS 3-PACK ----
     for color, cc in [("White", "WHT"), ("Earth Tone", "ETN"), ("Black", "BLK")]:
         products.append({
-            "sku": f"OT-SOX-{cc}",
+            "sku": f"NL-SOX-{cc}",
             "title": f"Crew Socks 3-Pack - {color}",
-            "parent_sku": "OT-SOX",
+            "parent_sku": "NL-SOX",
             "cost_price": Decimal("5.00"),
             "retail_price": Decimal("17.99"),
             "category": "accessories",
@@ -127,7 +138,7 @@ def _build_catalog():
 
     # ---- FIGURE 8 LIFTING STRAPS ----
     products.append({
-        "sku": "OT-F8S",
+        "sku": "NL-F8S",
         "title": "Figure 8 Lifting Straps",
         "parent_sku": None,
         "cost_price": Decimal("4.00"),
@@ -140,9 +151,9 @@ def _build_catalog():
     # ---- PERFECT SHAKER BOTTLE 28oz ----
     for color, cc in [("Black", "BLK"), ("Orange", "ORG"), ("White", "WHT")]:
         products.append({
-            "sku": f"OT-SHK-{cc}",
-            "title": f"Otishi Perfect Shaker Bottle 28oz - {color}",
-            "parent_sku": "OT-SHK",
+            "sku": f"NL-SHK-{cc}",
+            "title": f"Northline Perfect Shaker Bottle 28oz - {color}",
+            "parent_sku": "NL-SHK",
             "cost_price": Decimal("3.00"),
             "retail_price": Decimal("9.99"),
             "category": "accessories",
@@ -298,8 +309,7 @@ def _generate_inventory(products):
     sid = 5000
 
     for p in products:
-        w = _product_weight(p)
-        # Primary warehouse gets most stock, west coast gets ~40%
+        # Primary warehouse (Salt Lake City) holds most of the units.
         for wh_idx, wh in enumerate(WAREHOUSES):
             sid += 1
             wh_factor = 1.0 if wh_idx == 0 else 0.4
@@ -339,7 +349,7 @@ def _generate_inventory(products):
 
             sid += 1
             # Shopify snapshot (slight discrepancies for realism)
-            sp_on_hand = base + random.choice([0, 0, 0, 0, 0, -1, 1, -2, 2, -3])
+            sp_on_hand = max(0, base + random.choice([0, 0, 0, 0, 0, -1, 1, -2, 2, -3]))
             sp_available = max(sp_on_hand - allocated, 0)
             snapshots.append({
                 "snapshot_id": f"SNAP-SP-{sid}",
@@ -353,6 +363,40 @@ def _generate_inventory(products):
             })
 
     return snapshots
+
+
+def _apply_demo_story(orders, inventory):
+    """Pin a few SKUs so a walkthrough has a stockout, a buy, and quiet cash.
+
+    The rest of the catalog stays random. These overrides are what a person
+    should notice in the first minute.
+    """
+    now = datetime.now(timezone.utc)
+    for order in orders:
+        age_days = (now - order["created_at"]).days
+        if age_days < 120:
+            kept = [li for li in order["line_items"] if li["sku"] != "NL-F8S"]
+            if len(kept) != len(order["line_items"]):
+                order["line_items"] = kept
+                order["total_price"] = sum((li["price"] * li["quantity"] for li in kept), Decimal("0"))
+
+    # Available units in Salt Lake City. Las Vegas is left at zero for these
+    # so the story is easy to say out loud.
+    story = {
+        "NL-20-AND-9": 4,     # hero size, inside a 21-day lead time
+        "NL-20-AND-10": 2,
+        "NL-20-PSD-14": 0,    # already out
+        "NL-F8S": 480,        # straps, no sales for 120 days
+    }
+    for snap in inventory:
+        if snap["sku"] not in story:
+            continue
+        qty = story[snap["sku"]] if snap["warehouse"].startswith("Salt Lake") else 0
+        if snap["source"] == "shopify" and snap["sku"] == "NL-20-AND-9":
+            qty = qty + 2  # a small, real discrepancy to show on Stock
+        snap["quantity_on_hand"] = qty
+        snap["quantity_allocated"] = 0
+        snap["quantity_available"] = qty
 
 
 def _generate_reorder_rules(products):
@@ -406,7 +450,7 @@ def _generate_promotions():
             "start_date": now + timedelta(days=20),
             "end_date": now + timedelta(days=27),
             "discount_pct": 0.0,
-            "notes": "New Otishi 2.0 colorway launch — no discount, hype-driven.",
+            "notes": "New Northline 2.0 colorway launch — no discount, hype-driven.",
         },
     ]
 
@@ -415,12 +459,12 @@ def _generate_job_logs():
     """Generate recent job logs so the dashboard shows sync history."""
     now = datetime.now(timezone.utc)
     logs = []
-    for i, (job, hrs_ago) in enumerate([
-        ("shopify_sync", 2),
+    for job, hrs_ago in [
+        ("shopify_full_sync", 2),
         ("shiphero_sync", 1),
         ("reconciliation", 1),
-        ("forecast_update", 8),
-    ]):
+        ("forecasting", 8),
+    ]:
         started = now - timedelta(hours=hrs_ago, minutes=random.randint(0, 15))
         finished = started + timedelta(seconds=random.randint(3, 45))
         logs.append({
@@ -437,13 +481,31 @@ def _generate_job_logs():
 # Main seed routine
 # ---------------------------------------------------------------------------
 
+async def _ensure_demo_workspace(session) -> Workspace:
+    existing = (await session.execute(select(Workspace).where(Workspace.slug == "northline"))).scalar_one_or_none()
+    if existing:
+        return existing
+    workspace = Workspace(name="Northline Athletics", slug="northline", is_demo=True)
+    session.add(workspace)
+    await session.flush()
+    session.add(User(
+        workspace_id=workspace.id,
+        email="demo@northline.example",
+        password_hash=hash_password("northline-demo"),
+        role="owner",
+    ))
+    await session.flush()
+    return workspace
+
+
 async def seed(clear=True):
-    """Populate the database with demo data."""
+    """Populate the demo workspace with fictional Northline Athletics data."""
     await init_db()
 
     products = _build_catalog()
     orders = _generate_orders(products)
     inventory = _generate_inventory(products)
+    _apply_demo_story(orders, inventory)
     reorder_rules = _generate_reorder_rules(products)
     promotions = _generate_promotions()
     job_logs = _generate_job_logs()
@@ -459,18 +521,23 @@ async def seed(clear=True):
 
     async with async_session() as session:
         if clear:
-            from sqlalchemy import text
             print("Clearing existing data...")
             for table in [
                 "order_line_items", "orders", "inventory_snapshots",
-                "reorder_rules", "promotional_periods", "products", "job_logs",
+                "reorder_rules", "promotional_periods", "share_links",
+                "integration_credentials", "oauth_states", "audit_logs",
+                "products", "job_logs", "users", "workspaces",
             ]:
                 await session.execute(text(f"DELETE FROM {table}"))
             await session.flush()
 
+        workspace = await _ensure_demo_workspace(session)
+        ws = workspace.id
+
         print("Inserting products...")
         for p in products:
             session.add(Product(
+                workspace_id=ws,
                 sku=p["sku"],
                 title=p["title"],
                 parent_sku=p["parent_sku"],
@@ -482,6 +549,7 @@ async def seed(clear=True):
         batch = 0
         for o in orders:
             session.add(Order(
+                workspace_id=ws,
                 order_id=o["order_id"],
                 shopify_order_id=o["shopify_order_id"],
                 created_at=o["created_at"],
@@ -489,6 +557,7 @@ async def seed(clear=True):
             ))
             for li in o["line_items"]:
                 session.add(OrderLineItem(
+                    workspace_id=ws,
                     line_item_id=li["line_item_id"],
                     order_id=o["order_id"],
                     sku=li["sku"],
@@ -502,22 +571,33 @@ async def seed(clear=True):
 
         print("Inserting inventory snapshots...")
         for snap in inventory:
-            session.add(InventorySnapshot(**snap))
+            session.add(InventorySnapshot(workspace_id=ws, **snap))
 
         print("Inserting reorder rules...")
         for rule in reorder_rules:
-            session.add(ReorderRule(**rule))
+            session.add(ReorderRule(workspace_id=ws, **rule))
 
         print("Inserting promotions...")
         for promo in promotions:
-            session.add(PromotionalPeriod(**promo))
+            session.add(PromotionalPeriod(workspace_id=ws, **promo))
 
         print("Inserting job logs...")
         for log in job_logs:
-            session.add(JobLog(**log))
+            session.add(JobLog(workspace_id=ws, **log))
 
         await session.commit()
-        print("\nDone! Database seeded successfully.")
+        print("\nDone. Demo workspace: Northline Athletics (Salt Lake City).")
+
+
+async def seed_if_empty() -> bool:
+    """Seed only when the database has no products yet."""
+    await init_db()
+    async with async_session() as session:
+        count = await session.scalar(select(func.count()).select_from(Product))
+        if count:
+            return False
+    await seed(clear=False)
+    return True
 
 
 if __name__ == "__main__":
