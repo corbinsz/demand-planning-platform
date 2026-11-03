@@ -24,11 +24,7 @@ A full-stack demand planning application with Shopify and ShipHero API integrati
 
 ## Review it
 
-```bash
-./scripts/demo.sh
-```
-
-Open http://127.0.0.1:5173/ . The walkthrough is `docs/REVIEW-CHECKLIST.md`. Guides for an owner are in `docs/` (how it works, what changed, how to test, how to deploy one client, and why a brand would pay).
+No Docker required. The one-click hosted path is in [docs/PREVIEW.md](docs/PREVIEW.md): sign in to Render and deploy this repo. On a laptop, `./scripts/demo.sh` then http://127.0.0.1:5173/ . The walkthrough is `docs/REVIEW-CHECKLIST.md`.
 
 ## Quick Start
 
