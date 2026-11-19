@@ -1,18 +1,42 @@
 import logging
 from dataclasses import asdict
 
-from fastapi import APIRouter, Query, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 
 from app.database import async_session
-from app.services.forecasting import generate_forecast, generate_all_forecasts, get_reorder_alerts
+from app.services.forecasting import (
+    SKUForecast,
+    generate_all_forecasts,
+    generate_forecast,
+    get_reorder_alerts,
+)
+from app.services.reorder import calculate_urgency
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+_URGENCY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
+
+def _with_urgency(forecast: SKUForecast) -> dict:
+    """Serialize a forecast and add the same urgency label the PO page uses."""
+    row = asdict(forecast)
+    row["urgency"] = calculate_urgency(
+        forecast.days_of_stock_remaining, forecast.lead_time_days
+    )
+    return row
+
+
 FORECAST_SORT_KEYS = {
-    "sku", "title", "rolling_30d_avg", "forecast_30d", "forecast_60d",
-    "forecast_90d", "current_stock", "days_of_stock_remaining",
+    "sku",
+    "title",
+    "rolling_30d_avg",
+    "forecast_30d",
+    "forecast_60d",
+    "forecast_90d",
+    "current_stock",
+    "days_of_stock_remaining",
 }
 
 
@@ -28,12 +52,17 @@ async def list_forecasts(
         all_forecasts = await generate_all_forecasts()
     except Exception as e:
         logger.error(f"Forecast generation failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to generate forecasts: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to generate forecasts: {e}"
+        )
 
     # Sort in-memory
     if sort_by in FORECAST_SORT_KEYS:
         all_forecasts.sort(
-            key=lambda f: (getattr(f, sort_by, None) is None, getattr(f, sort_by, None) or 0),
+            key=lambda f: (
+                getattr(f, sort_by, None) is None,
+                getattr(f, sort_by, None) or 0,
+            ),
             reverse=(sort_dir == "desc"),
         )
 
@@ -58,11 +87,21 @@ async def reorder_alerts():
         alerts = await get_reorder_alerts()
     except Exception as e:
         logger.error(f"Reorder alerts failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to load reorder alerts: {e}")
-    return {
-        "items": [asdict(a) for a in alerts],
-        "total": len(alerts),
-    }
+        raise HTTPException(
+            status_code=500, detail=f"Failed to load reorder alerts: {e}"
+        )
+    items = [_with_urgency(alert) for alert in alerts]
+    items.sort(
+        key=lambda row: (
+            _URGENCY_RANK[row["urgency"]],
+            (
+                row["days_of_stock_remaining"]
+                if row["days_of_stock_remaining"] is not None
+                else -1
+            ),
+        )
+    )
+    return {"items": items, "total": len(items)}
 
 
 @router.get("/{sku}")
@@ -73,7 +112,9 @@ async def get_sku_forecast(sku: str):
             forecast = await generate_forecast(session, sku)
     except Exception as e:
         logger.error(f"Forecast for {sku} failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to generate forecast for {sku}: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to generate forecast for {sku}: {e}"
+        )
     if not forecast:
         raise HTTPException(status_code=404, detail=f"No forecast data for SKU: {sku}")
     return asdict(forecast)

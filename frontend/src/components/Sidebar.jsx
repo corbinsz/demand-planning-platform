@@ -60,6 +60,9 @@ export default function Sidebar() {
             <span style={{ fontSize: '10px', color: 'rgba(255,255,255,0.4)', letterSpacing: '0.5px' }}>
               DEMAND PLANNING
             </span>
+            <span style={{ display: 'block', fontSize: '10px', color: 'rgba(255,255,255,0.45)', marginTop: '2px' }}>
+              Synthetic demo
+            </span>
           </div>
         </div>
       </div>

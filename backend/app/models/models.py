@@ -1,21 +1,25 @@
-from datetime import datetime, timezone
+"""SQLAlchemy models for products, orders, stock snapshots, and planning rules."""
+
+from datetime import UTC, datetime
 from decimal import Decimal
+
 from sqlalchemy import (
-    String,
-    Integer,
-    Numeric,
     DateTime,
     Float,
     ForeignKey,
     Index,
+    Integer,
+    Numeric,
+    String,
     Text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+
 from app.database import Base
 
 
 def _utcnow():
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 class Product(Base):
@@ -30,10 +34,13 @@ class Product(Base):
     image_url: Mapped[str | None] = mapped_column(String(500))
     cost_price: Mapped[Decimal | None] = mapped_column(Numeric(12, 2))
     parent_sku: Mapped[str | None] = mapped_column(String(100))
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
 
     order_line_items: Mapped[list["OrderLineItem"]] = relationship(
-        back_populates="product", primaryjoin="Product.sku == foreign(OrderLineItem.sku)"
+        back_populates="product",
+        primaryjoin="Product.sku == foreign(OrderLineItem.sku)",
     )
     inventory_snapshots: Mapped[list["InventorySnapshot"]] = relationship(
         back_populates="product",
@@ -58,7 +65,9 @@ class Order(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     order_id: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
     shopify_order_id: Mapped[str | None] = mapped_column(String(100))
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
     total_price: Mapped[Decimal | None] = mapped_column(Numeric(12, 2))
 
     line_items: Mapped[list["OrderLineItem"]] = relationship(back_populates="order")
@@ -100,8 +109,12 @@ class InventorySnapshot(Base):
     quantity_allocated: Mapped[int] = mapped_column(Integer, default=0)
     quantity_available: Mapped[int] = mapped_column(Integer, default=0)
     warehouse: Mapped[str | None] = mapped_column(String(200))
-    source: Mapped[str] = mapped_column(String(50), nullable=False)  # shopify | shiphero
-    recorded_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    source: Mapped[str] = mapped_column(
+        String(50), nullable=False
+    )  # shopify | shiphero
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
 
     product: Mapped["Product | None"] = relationship(
         back_populates="inventory_snapshots",
@@ -138,11 +151,15 @@ class PromotionalPeriod(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
-    start_date: Mapped[datetime] = mapped_column(DateTime, nullable=False)
-    end_date: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    start_date: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    end_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     discount_pct: Mapped[float] = mapped_column(Float, default=0)
     notes: Mapped[str | None] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
 
 
 class JobLog(Base):
@@ -150,8 +167,12 @@ class JobLog(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     job_name: Mapped[str] = mapped_column(String(200), nullable=False)
-    status: Mapped[str] = mapped_column(String(50), nullable=False)  # running | success | failed
-    started_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
-    finished_at: Mapped[datetime | None] = mapped_column(DateTime)
+    status: Mapped[str] = mapped_column(
+        String(50), nullable=False
+    )  # running | success | failed
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error_message: Mapped[str | None] = mapped_column(Text)
     records_processed: Mapped[int | None] = mapped_column(Integer)

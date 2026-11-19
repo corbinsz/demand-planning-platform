@@ -1,15 +1,14 @@
 import asyncio
 import logging
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 
 import httpx
-from sqlalchemy import select
 
 from app.config import get_settings
 from app.database import async_session, get_upsert
-from app.models.models import Product, Order, OrderLineItem, InventorySnapshot
+from app.models.models import InventorySnapshot, Order, OrderLineItem, Product
 
 upsert = get_upsert()
 
@@ -43,8 +42,10 @@ async def _request_with_backoff(
     for attempt in range(MAX_RETRIES):
         response = await client.request(method, url, **kwargs)
         if response.status_code == 429:
-            retry_after = float(response.headers.get("Retry-After", 2 ** attempt))
-            logger.warning(f"Rate limited. Retrying after {retry_after}s (attempt {attempt + 1})")
+            retry_after = float(response.headers.get("Retry-After", 2**attempt))
+            logger.warning(
+                f"Rate limited. Retrying after {retry_after}s (attempt {attempt + 1})"
+            )
             await asyncio.sleep(retry_after)
             continue
         response.raise_for_status()
@@ -57,7 +58,7 @@ async def _request_with_backoff(
 async def fetch_all_products() -> list[dict]:
     """Fetch all products and variants with SKUs from Shopify."""
     products = []
-    url = f"{BASE_URL}/products.json?limit={PAGE_LIMIT}"
+    url: str | None = f"{BASE_URL}/products.json?limit={PAGE_LIMIT}"
 
     async with httpx.AsyncClient(headers=HEADERS, timeout=30) as client:
         while url:
@@ -78,8 +79,8 @@ async def fetch_all_products() -> list[dict]:
 async def fetch_orders(days: int = 365) -> list[dict]:
     """Fetch orders from the last N days with line items."""
     orders = []
-    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-    url = (
+    since = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+    url: str | None = (
         f"{BASE_URL}/orders.json?limit={PAGE_LIMIT}&status=any"
         f"&created_at_min={since}&fields=id,name,created_at,total_price,line_items"
     )
@@ -109,7 +110,7 @@ async def fetch_inventory_levels() -> list[dict]:
 
         levels = []
         for loc in locations:
-            url = (
+            url: str | None = (
                 f"{BASE_URL}/inventory_levels.json"
                 f"?location_ids={loc['id']}&limit={PAGE_LIMIT}"
             )
@@ -296,7 +297,16 @@ async def sync_inventory_levels() -> int:
 
 
 async def full_sync() -> dict:
-    """Run full Shopify sync: products, orders, inventory."""
+    """Run a full Shopify sync, or skip when no access token is configured."""
+    from app.config import is_placeholder_secret
+
+    if is_placeholder_secret(settings.shopify_access_token):
+        logger.info("Shopify sync skipped: access token is not configured")
+        return {
+            "products_synced": 0,
+            "order_line_items_synced": 0,
+            "inventory_levels_synced": 0,
+        }
     products = await sync_products()
     orders = await sync_orders()
     inventory = await sync_inventory_levels()

@@ -1,14 +1,16 @@
-import logging
-from dataclasses import asdict
+"""Purchase-order suggestions and reorder-rule edits."""
 
-from fastapi import APIRouter, Depends, Query, HTTPException
+import logging
+
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import select, func
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.models.models import ReorderRule, Product
+from app.models.models import Product, ReorderRule
 from app.services.forecasting import get_reorder_alerts
+from app.services.reorder import calculate_urgency
 from app.services.shiphero_sync import fetch_open_purchase_orders
 
 logger = logging.getLogger(__name__)
@@ -19,6 +21,7 @@ class ReorderRuleUpdate(BaseModel):
     reorder_quantity: int = Field(ge=1)
     lead_time_days: int = Field(ge=1, le=365)
     safety_stock: int = Field(ge=0)
+
 
 router = APIRouter()
 
@@ -32,8 +35,16 @@ async def list_purchase_orders():
         logger.error(f"Failed to fetch POs from ShipHero: {e}")
         error_msg = str(e)
         if "401" in error_msg or "UNAUTHORIZED" in error_msg.upper():
-            return {"items": [], "total": 0, "error": "ShipHero authentication failed. Check your API token in Setup."}
-        return {"items": [], "total": 0, "error": f"Failed to fetch from ShipHero: {error_msg}"}
+            return {
+                "items": [],
+                "total": 0,
+                "error": "ShipHero authentication failed. Check your API token in Setup.",
+            }
+        return {
+            "items": [],
+            "total": 0,
+            "error": f"Failed to fetch from ShipHero: {error_msg}",
+        }
     return {"items": pos, "total": len(pos)}
 
 
@@ -44,25 +55,31 @@ async def po_suggestions():
         alerts = await get_reorder_alerts()
     except Exception as e:
         logger.error(f"Failed to generate PO suggestions: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to generate suggestions: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to generate suggestions: {e}"
+        )
 
     suggestions = []
     for alert in alerts:
-        suggestions.append({
-            "sku": alert.sku,
-            "title": alert.title,
-            "current_stock": alert.current_stock,
-            "reorder_point": alert.reorder_point,
-            "suggested_quantity": alert.suggested_reorder_qty,
-            "daily_velocity": alert.rolling_30d_avg,
-            "days_of_stock_remaining": alert.days_of_stock_remaining,
-            "lead_time_days": alert.lead_time_days,
-            "urgency": _calculate_urgency(alert.days_of_stock_remaining, alert.lead_time_days),
-        })
+        suggestions.append(
+            {
+                "sku": alert.sku,
+                "title": alert.title,
+                "current_stock": alert.current_stock,
+                "reorder_point": alert.reorder_point,
+                "suggested_quantity": alert.suggested_reorder_qty,
+                "daily_velocity": alert.rolling_30d_avg,
+                "days_of_stock_remaining": alert.days_of_stock_remaining,
+                "lead_time_days": alert.lead_time_days,
+                "urgency": calculate_urgency(
+                    alert.days_of_stock_remaining, alert.lead_time_days
+                ),
+            }
+        )
 
     # Sort by urgency (critical first)
     priority = {"critical": 0, "high": 1, "medium": 2, "low": 3}
-    suggestions.sort(key=lambda x: priority.get(x["urgency"], 99))
+    suggestions.sort(key=lambda x: priority.get(str(x["urgency"]), 99))
 
     return {"items": suggestions, "total": len(suggestions)}
 
@@ -141,16 +158,3 @@ async def update_reorder_rule(
         "lead_time_days": rule.lead_time_days,
         "safety_stock": rule.safety_stock,
     }
-
-
-def _calculate_urgency(days_remaining: float | None, lead_time: int) -> str:
-    """Calculate urgency level for reorder."""
-    if days_remaining is None or days_remaining <= 0:
-        return "critical"
-    if days_remaining <= lead_time:
-        return "critical"
-    if days_remaining <= lead_time * 1.5:
-        return "high"
-    if days_remaining <= lead_time * 2:
-        return "medium"
-    return "low"

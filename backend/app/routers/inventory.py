@@ -1,14 +1,24 @@
+"""Inventory list, warehouse reconciliation, and per-SKU detail."""
+
 import logging
 from dataclasses import asdict
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
-from fastapi import APIRouter, Depends, Query, HTTPException
-from sqlalchemy import select, func
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database import get_db
-from app.models.models import Product, InventorySnapshot, Order, OrderLineItem, ReorderRule
-from app.services.reconciliation import reconcile_inventory, get_discrepancies
+from app.database import day_bucket, get_db
+from app.models.models import (
+    InventorySnapshot,
+    Order,
+    OrderLineItem,
+    Product,
+    ReorderRule,
+)
+from app.services.reconciliation import get_discrepancies, reconcile_inventory
+from app.services.stock import position_for_sku
+from app.timeutil import as_date_str
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -36,22 +46,19 @@ async def list_inventory(
     db: AsyncSession = Depends(get_db),
 ):
     """Paginated SKU inventory with search, filters, and sorting."""
-    query = (
-        select(
-            InventorySnapshot.sku,
-            Product.title,
-            InventorySnapshot.quantity_on_hand,
-            InventorySnapshot.quantity_allocated,
-            InventorySnapshot.quantity_available,
-            InventorySnapshot.warehouse,
-            InventorySnapshot.source,
-            InventorySnapshot.recorded_at,
-            Product.image_url,
-            Product.cost_price,
-            Product.parent_sku,
-        )
-        .outerjoin(Product, InventorySnapshot.sku == Product.sku)
-    )
+    query = select(
+        InventorySnapshot.sku,
+        Product.title,
+        InventorySnapshot.quantity_on_hand,
+        InventorySnapshot.quantity_allocated,
+        InventorySnapshot.quantity_available,
+        InventorySnapshot.warehouse,
+        InventorySnapshot.source,
+        InventorySnapshot.recorded_at,
+        Product.image_url,
+        Product.cost_price,
+        Product.parent_sku,
+    ).outerjoin(Product, InventorySnapshot.sku == Product.sku)
 
     if search:
         query = query.where(
@@ -109,7 +116,9 @@ async def reconciled_inventory():
         records = await reconcile_inventory()
     except Exception as e:
         logger.error(f"Inventory reconciliation failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to reconcile inventory: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to reconcile inventory: {e}"
+        )
     return {"items": [asdict(r) for r in records], "total": len(records)}
 
 
@@ -120,7 +129,9 @@ async def inventory_discrepancies():
         records = await get_discrepancies()
     except Exception as e:
         logger.error(f"Discrepancy check failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to check discrepancies: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to check discrepancies: {e}"
+        )
     return {"items": [asdict(r) for r in records], "total": len(records)}
 
 
@@ -154,18 +165,18 @@ async def sku_detail(sku: str, db: AsyncSession = Depends(get_db)):
     snapshots = snap_result.scalars().all()
 
     # Sales history (last 90 days)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     ninety_days_ago = now - timedelta(days=90)
     sales_result = await db.execute(
         select(
-            func.strftime('%Y-%m-%d', Order.created_at).label("date"),
+            day_bucket(Order.created_at).label("date"),
             func.sum(OrderLineItem.quantity).label("units"),
             func.sum(OrderLineItem.price * OrderLineItem.quantity).label("revenue"),
         )
         .join(Order, OrderLineItem.order_id == Order.order_id)
         .where(OrderLineItem.sku == sku, Order.created_at >= ninety_days_ago)
-        .group_by(func.strftime('%Y-%m-%d', Order.created_at))
-        .order_by(func.strftime('%Y-%m-%d', Order.created_at))
+        .group_by(day_bucket(Order.created_at))
+        .order_by(day_bucket(Order.created_at))
     )
     sales_rows = sales_result.all()
 
@@ -182,13 +193,11 @@ async def sku_detail(sku: str, db: AsyncSession = Depends(get_db)):
     totals = totals_result.one()
 
     # Reorder rule
-    rule_result = await db.execute(
-        select(ReorderRule).where(ReorderRule.sku == sku)
-    )
+    rule_result = await db.execute(select(ReorderRule).where(ReorderRule.sku == sku))
     rule = rule_result.scalar_one_or_none()
 
-    # Current stock (latest shiphero snapshot)
-    latest_snap = next((s for s in snapshots if s.source == "shiphero"), None)
+    # Current stock: newest ShipHero snapshot in each warehouse, summed.
+    position = await position_for_sku(db, sku, "shiphero")
 
     return {
         "sku": sku,
@@ -200,11 +209,15 @@ async def sku_detail(sku: str, db: AsyncSession = Depends(get_db)):
         "shiphero_id": product.shiphero_id,
         "created_at": product.created_at.isoformat() if product.created_at else None,
         "current_stock": {
-            "on_hand": latest_snap.quantity_on_hand if latest_snap else 0,
-            "allocated": latest_snap.quantity_allocated if latest_snap else 0,
-            "available": latest_snap.quantity_available if latest_snap else 0,
-            "warehouse": latest_snap.warehouse if latest_snap else None,
-            "last_updated": latest_snap.recorded_at.isoformat() if latest_snap else None,
+            "on_hand": position.on_hand if position else 0,
+            "allocated": position.allocated if position else 0,
+            "available": position.available if position else 0,
+            "warehouse": position.warehouses if position else None,
+            "last_updated": (
+                position.recorded_at.isoformat()
+                if position and position.recorded_at
+                else None
+            ),
         },
         "stock_history": [
             {
@@ -219,18 +232,26 @@ async def sku_detail(sku: str, db: AsyncSession = Depends(get_db)):
         ],
         "sales_90d": {
             "total_units": totals[0],
-            "total_revenue": float(totals[1]),
+            "total_revenue": float(totals[1] or 0),
             "total_orders": totals[2],
             "daily_avg": round(totals[0] / 90, 2) if totals[0] else 0,
             "timeline": [
-                {"date": r[0], "units": r[1], "revenue": float(r[2]) if r[2] else 0}
+                {
+                    "date": as_date_str(r[0]),
+                    "units": r[1],
+                    "revenue": float(r[2]) if r[2] else 0,
+                }
                 for r in sales_rows
             ],
         },
-        "reorder_rule": {
-            "reorder_point": rule.reorder_point,
-            "reorder_quantity": rule.reorder_quantity,
-            "lead_time_days": rule.lead_time_days,
-            "safety_stock": rule.safety_stock,
-        } if rule else None,
+        "reorder_rule": (
+            {
+                "reorder_point": rule.reorder_point,
+                "reorder_quantity": rule.reorder_quantity,
+                "lead_time_days": rule.lead_time_days,
+                "safety_stock": rule.safety_stock,
+            }
+            if rule
+            else None
+        ),
     }

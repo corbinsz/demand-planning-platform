@@ -1,25 +1,41 @@
+"""Per-SKU demand forecasts.
+
+Daily sales are cleaned, checked for a weekly or monthly repeat, and passed
+to Holt-Winters exponential smoothing. A short or awkward series falls back
+to its recent average so one bad SKU does not fail the page. The model is
+fit once per SKU and the 30, 60, and 90 day totals are slices of that
+forecast. Results are cached in memory for 30 minutes.
+"""
+
 import logging
+import warnings
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import numpy as np
 import pandas as pd
-from sqlalchemy import select, and_, func
+from sqlalchemy import and_, func, select
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 
-from app.database import async_session, get_upsert
-from app.models.models import OrderLineItem, Order, ReorderRule, Product, InventorySnapshot
+from app.database import async_session, day_bucket, get_upsert
+from app.models.models import Order, OrderLineItem, Product, ReorderRule
+from app.services.reorder import compute_reorder_point, suggest_order_quantity
+from app.services.stock import position_for_sku, positions_by_sku
 
 logger = logging.getLogger(__name__)
 
-# In-memory forecast cache
 _forecast_cache: dict = {"data": [], "expires": None}
 CACHE_TTL_MINUTES = 30
+_MIN_HISTORY_DAYS = 14
+_SEASONAL_HISTORY_DAYS = 60
+_SEASONAL_AUTOCORR = 0.3
 
 
 @dataclass
 class SKUForecast:
+    """Forecast and reorder fields for one SKU."""
+
     sku: str
     title: str
     avg_daily_velocity_30d: float
@@ -39,91 +55,112 @@ class SKUForecast:
     safety_stock: int
 
 
-async def _get_daily_sales(session, sku: str, days: int = 365) -> pd.DataFrame:
-    """Get daily sales aggregation for a SKU."""
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+def clear_forecast_cache() -> None:
+    """Drop the in-memory forecast cache. Tests call this between cases."""
+    _forecast_cache["data"] = []
+    _forecast_cache["expires"] = None
 
+
+def _rows_to_frame(rows: list[tuple]) -> pd.DataFrame:
+    """Daily quantity frame with missing days filled as zero sales."""
+    if not rows:
+        return pd.DataFrame(columns=["date", "quantity"])
+    frame = pd.DataFrame(rows, columns=["date", "quantity"])
+    frame["date"] = pd.to_datetime(frame["date"])
+    date_range = pd.date_range(
+        start=frame["date"].min(), end=frame["date"].max(), freq="D"
+    )
+    frame = frame.set_index("date").reindex(date_range, fill_value=0).reset_index()
+    frame.columns = ["date", "quantity"]
+    return frame
+
+
+async def _get_daily_sales(session, sku: str, days: int = 365) -> pd.DataFrame:
+    """Daily units sold for one SKU over the last ``days`` days."""
+    cutoff = datetime.now(UTC) - timedelta(days=days)
+    sale_day = day_bucket(Order.created_at)
     result = await session.execute(
         select(
-            func.strftime('%Y-%m-%d', Order.created_at).label("sale_date"),
+            sale_day.label("sale_date"),
             func.sum(OrderLineItem.quantity).label("total_qty"),
         )
         .join(Order, OrderLineItem.order_id == Order.order_id)
-        .where(
-            and_(
-                OrderLineItem.sku == sku,
-                Order.created_at >= cutoff,
-            )
-        )
-        .group_by(func.strftime('%Y-%m-%d', Order.created_at))
-        .order_by(func.strftime('%Y-%m-%d', Order.created_at))
+        .where(and_(OrderLineItem.sku == sku, Order.created_at >= cutoff))
+        .group_by(sale_day)
+        .order_by(sale_day)
     )
-    rows = result.all()
-
-    if not rows:
-        return pd.DataFrame(columns=["date", "quantity"])
-
-    df = pd.DataFrame(rows, columns=["date", "quantity"])
-    df["date"] = pd.to_datetime(df["date"])
-
-    # Fill missing days with 0
-    date_range = pd.date_range(start=df["date"].min(), end=df["date"].max(), freq="D")
-    df = df.set_index("date").reindex(date_range, fill_value=0).reset_index()
-    df.columns = ["date", "quantity"]
-    return df
+    return _rows_to_frame(result.all())
 
 
 def _remove_outliers(series: pd.Series, z_threshold: float = 3.0) -> pd.Series:
-    """Remove outliers using z-score method."""
-    if len(series) < 10:
-        return series.astype(float)
-    mean = series.mean()
-    std = series.std()
+    """Replace days more than ``z_threshold`` standard deviations from the mean.
+
+    A one-off bulk order would otherwise dominate the forecast. Short series
+    are left alone because a z-score is not meaningful yet.
+    """
+    values = series.astype(float)
+    if len(values) < 10:
+        return values
+    std = float(values.std())
     if std == 0:
-        return series.astype(float)
-    z_scores = np.abs((series - mean) / std)
-    cleaned = series.astype(float).copy()
+        return values
+    mean = float(values.mean())
+    z_scores = np.abs((values - mean) / std)
+    cleaned = values.copy()
     cleaned[z_scores > z_threshold] = mean
     return cleaned
 
 
-def _calculate_velocity(df: pd.DataFrame, days: int) -> float:
-    """Calculate average daily velocity over N most recent days."""
-    if df.empty:
+def _calculate_velocity(frame: pd.DataFrame, days: int) -> float:
+    """Mean daily units over the most recent ``days`` rows."""
+    if frame.empty:
         return 0.0
-    recent = df.tail(days)
-    return round(recent["quantity"].mean(), 2)
+    return round(float(frame.tail(days)["quantity"].mean()), 2)
 
 
-def _detect_seasonality(df: pd.DataFrame) -> bool:
-    """Simple seasonality detection using autocorrelation."""
-    if len(df) < 60:
+def _detect_seasonality(frame: pd.DataFrame) -> bool:
+    """True when weekly (lag 7) or monthly (lag 30) autocorrelation is strong."""
+    if len(frame) < _SEASONAL_HISTORY_DAYS:
         return False
-    series = df["quantity"]
-    if series.std() == 0:
+    series = frame["quantity"]
+    if float(series.std()) == 0:
         return False
     autocorr_7 = series.autocorr(lag=7)
     autocorr_30 = series.autocorr(lag=30)
     return bool(
-        (pd.notna(autocorr_7) and autocorr_7 > 0.3)
-        or (pd.notna(autocorr_30) and autocorr_30 > 0.3)
+        (pd.notna(autocorr_7) and autocorr_7 > _SEASONAL_AUTOCORR)
+        or (pd.notna(autocorr_30) and autocorr_30 > _SEASONAL_AUTOCORR)
     )
 
 
-def _exponential_smoothing_forecast(
-    df: pd.DataFrame, periods: int, seasonal: bool
-) -> float:
-    """Apply exponential smoothing and forecast N days ahead."""
-    series = _remove_outliers(df["quantity"])
+def _mean_horizons(series: pd.Series) -> tuple[float, float, float]:
+    """Project the recent daily average across 30, 60, and 90 days."""
+    mean_val = series.mean()
+    if pd.isna(mean_val):
+        mean_val = 0.0
+    daily = float(mean_val)
+    return (
+        round(daily * 30, 0),
+        round(daily * 60, 0),
+        round(daily * 90, 0),
+    )
 
-    if len(series) < 14:
-        mean_val = series.mean()
-        if pd.isna(mean_val):
-            return 0.0
-        return round(mean_val * periods, 0)
+
+def forecast_horizons(
+    frame: pd.DataFrame, seasonal: bool
+) -> tuple[float, float, float]:
+    """Forecast total units over the next 30, 60, and 90 days.
+
+    The smoother is fit once. Each horizon is the sum of that many days,
+    and any negative day is clipped to zero before the sum.
+    """
+    series = _remove_outliers(frame["quantity"]).reset_index(drop=True)
+    if len(series) < _MIN_HISTORY_DAYS:
+        return _mean_horizons(series)
 
     try:
-        if seasonal and len(series) >= 60:
+        use_season = seasonal and len(series) >= _SEASONAL_HISTORY_DAYS
+        if use_season:
             model = ExponentialSmoothing(
                 series,
                 trend="add",
@@ -135,101 +172,63 @@ def _exponential_smoothing_forecast(
             model = ExponentialSmoothing(
                 series,
                 trend="add",
+                seasonal=None,
                 initialization_method="estimated",
             )
-        fitted = model.fit(optimized=True)
-        forecast = fitted.forecast(periods)
-        return round(max(forecast.sum(), 0), 0)
-    except Exception as e:
-        logger.warning(f"Exponential smoothing failed, falling back to average: {e}")
-        mean_val = series.mean()
-        if pd.isna(mean_val):
-            return 0.0
-        return round(mean_val * periods, 0)
-
-
-async def generate_forecast(session, sku: str) -> SKUForecast | None:
-    """Generate a complete forecast for a single SKU (uses shared session)."""
-    df = await _get_daily_sales(session, sku, days=365)
-    if df.empty:
-        return None
-
-    # Get product title
-    product = await session.execute(
-        select(Product.title).where(Product.sku == sku)
-    )
-    title = product.scalar_one_or_none() or "Unknown"
-
-    # Get reorder rules
-    rule_result = await session.execute(
-        select(ReorderRule).where(ReorderRule.sku == sku)
-    )
-    rule = rule_result.scalar_one_or_none()
-
-    # Get current stock from latest ShipHero snapshot
-    stock_result = await session.execute(
-        select(func.sum(InventorySnapshot.quantity_available))
-        .where(
-            and_(
-                InventorySnapshot.sku == sku,
-                InventorySnapshot.source == "shiphero",
-            )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            fitted = model.fit(optimized=True)
+            daily = fitted.forecast(90).clip(lower=0)
+        return (
+            round(float(daily.iloc[:30].sum()), 0),
+            round(float(daily.iloc[:60].sum()), 0),
+            round(float(daily.sum()), 0),
         )
-    )
-    current_stock = stock_result.scalar_one() or 0
-
-    lead_time = rule.lead_time_days if rule else 14
-    safety_stock = rule.safety_stock if rule else 0
-
-    return _generate_forecast_from_data(sku, title, df, rule, current_stock, lead_time, safety_stock)
+    except Exception as exc:
+        logger.warning(
+            "Exponential smoothing failed, using the recent average: %s", exc
+        )
+        return _mean_horizons(series)
 
 
 def _generate_forecast_from_data(
     sku: str,
     title: str,
-    df: pd.DataFrame,
-    rule,
+    frame: pd.DataFrame,
+    rule: ReorderRule | None,
     current_stock: int,
     lead_time: int,
     safety_stock: int,
 ) -> SKUForecast:
-    """Pure computation — build a SKUForecast from pre-fetched data (no DB queries)."""
-    velocity_30d = _calculate_velocity(df, 30)
-    velocity_90d = _calculate_velocity(df, 90)
-    velocity_365d = _calculate_velocity(df, 365)
+    """Build one forecast from data that has already been loaded."""
+    velocity_30d = _calculate_velocity(frame, 30)
+    velocity_90d = _calculate_velocity(frame, 90)
+    velocity_365d = _calculate_velocity(frame, 365)
 
-    # Rolling 30-day average
-    if len(df) >= 30:
-        rolling = df["quantity"].rolling(window=30).mean()
+    if len(frame) >= 30:
+        rolling = frame["quantity"].rolling(window=30).mean()
         last_val = rolling.iloc[-1]
-        rolling_30d = round(last_val, 2) if pd.notna(last_val) else velocity_30d
+        rolling_30d = round(float(last_val), 2) if pd.notna(last_val) else velocity_30d
     else:
         rolling_30d = velocity_30d
 
-    has_seasonality = _detect_seasonality(df)
+    has_seasonality = _detect_seasonality(frame)
+    forecast_30d, forecast_60d, forecast_90d = forecast_horizons(frame, has_seasonality)
 
-    forecast_30d = _exponential_smoothing_forecast(df, 30, has_seasonality)
-    forecast_60d = _exponential_smoothing_forecast(df, 60, has_seasonality)
-    forecast_90d = _exponential_smoothing_forecast(df, 90, has_seasonality)
-
-    # Reorder point = (avg daily sales x lead_time_days) + safety_stock
-    reorder_point = int(np.ceil(rolling_30d * lead_time) + safety_stock)
-    if rule:
-        reorder_point = max(reorder_point, rule.reorder_point)
-
-    below_reorder = current_stock <= reorder_point
-
-    # Suggested reorder qty: weeks_of_supply_target (default 8 weeks)
-    weeks_target = 8
-    suggested_qty = max(
-        int(np.ceil(rolling_30d * 7 * weeks_target)) - current_stock, 0
+    reorder_point = compute_reorder_point(
+        rolling_30d,
+        lead_time,
+        safety_stock,
+        rule_floor=rule.reorder_point if rule else None,
     )
-    if rule and rule.reorder_quantity:
-        suggested_qty = max(suggested_qty, rule.reorder_quantity)
-
-    days_remaining = (
-        round(current_stock / rolling_30d, 1) if rolling_30d > 0 else None
+    below_reorder = reorder_point > 0 and current_stock <= reorder_point
+    suggested_qty = suggest_order_quantity(
+        rolling_30d,
+        current_stock,
+        below_reorder_point=below_reorder,
+        minimum_quantity=rule.reorder_quantity if rule else None,
     )
+    days_remaining = round(current_stock / rolling_30d, 1) if rolling_30d > 0 else None
 
     return SKUForecast(
         sku=sku,
@@ -252,142 +251,125 @@ def _generate_forecast_from_data(
     )
 
 
-# ---- Batch query helpers for generate_all_forecasts ----
+async def generate_forecast(session, sku: str) -> SKUForecast | None:
+    """Forecast one SKU. Returns None when that SKU has no sales."""
+    frame = await _get_daily_sales(session, sku, days=365)
+    if frame.empty:
+        return None
+
+    product = await session.execute(select(Product.title).where(Product.sku == sku))
+    title = product.scalar_one_or_none() or "Unknown"
+    rule_result = await session.execute(
+        select(ReorderRule).where(ReorderRule.sku == sku)
+    )
+    rule = rule_result.scalar_one_or_none()
+    position = await position_for_sku(session, sku, "shiphero")
+    current_stock = position.available if position else 0
+    lead_time = rule.lead_time_days if rule else 14
+    safety_stock = rule.safety_stock if rule else 0
+    return _generate_forecast_from_data(
+        sku, title, frame, rule, current_stock, lead_time, safety_stock
+    )
+
 
 async def _get_all_daily_sales(session, days: int = 365) -> dict[str, pd.DataFrame]:
-    """Single query for ALL SKU daily sales, grouped into per-SKU DataFrames."""
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-
+    """One query for every SKU's daily sales."""
+    cutoff = datetime.now(UTC) - timedelta(days=days)
+    sale_day = day_bucket(Order.created_at)
     result = await session.execute(
         select(
             OrderLineItem.sku,
-            func.strftime('%Y-%m-%d', Order.created_at).label("sale_date"),
+            sale_day.label("sale_date"),
             func.sum(OrderLineItem.quantity).label("total_qty"),
         )
         .join(Order, OrderLineItem.order_id == Order.order_id)
         .where(Order.created_at >= cutoff)
-        .group_by(OrderLineItem.sku, func.strftime('%Y-%m-%d', Order.created_at))
-        .order_by(OrderLineItem.sku, func.strftime('%Y-%m-%d', Order.created_at))
+        .group_by(OrderLineItem.sku, sale_day)
+        .order_by(OrderLineItem.sku, sale_day)
     )
-    rows = result.all()
-
-    # Group rows by SKU
-    sku_rows: dict[str, list] = defaultdict(list)
-    for sku, sale_date, total_qty in rows:
-        sku_rows[sku].append((sale_date, total_qty))
-
-    # Build per-SKU DataFrames with gap-filling
-    sku_dfs: dict[str, pd.DataFrame] = {}
-    for sku, data in sku_rows.items():
-        df = pd.DataFrame(data, columns=["date", "quantity"])
-        df["date"] = pd.to_datetime(df["date"])
-        date_range = pd.date_range(start=df["date"].min(), end=df["date"].max(), freq="D")
-        df = df.set_index("date").reindex(date_range, fill_value=0).reset_index()
-        df.columns = ["date", "quantity"]
-        sku_dfs[sku] = df
-
-    return sku_dfs
-
-
-async def _get_all_titles(session) -> dict[str, str]:
-    """All product titles in one query."""
-    result = await session.execute(select(Product.sku, Product.title))
-    return {sku: (title or "Unknown") for sku, title in result.all()}
-
-
-async def _get_all_reorder_rules(session) -> dict[str, ReorderRule]:
-    """All reorder rules in one query."""
-    result = await session.execute(select(ReorderRule))
-    return {rule.sku: rule for rule in result.scalars().all()}
-
-
-async def _get_all_stock(session) -> dict[str, int]:
-    """Latest inventory snapshot per SKU in one query."""
-    result = await session.execute(
-        select(
-            InventorySnapshot.sku,
-            func.sum(InventorySnapshot.quantity_available).label("total_stock"),
-        )
-        .where(InventorySnapshot.source == "shiphero")
-        .group_by(InventorySnapshot.sku)
-    )
-    return {sku: (stock or 0) for sku, stock in result.all()}
+    grouped: dict[str, list] = defaultdict(list)
+    for sku, sale_date, total_qty in result.all():
+        grouped[sku].append((sale_date, total_qty))
+    return {sku: _rows_to_frame(rows) for sku, rows in grouped.items()}
 
 
 async def generate_all_forecasts() -> list[SKUForecast]:
-    """Generate forecasts for all active SKUs (cached). Uses batch queries."""
-    now = datetime.now(timezone.utc)
-    if _forecast_cache["expires"] and now < _forecast_cache["expires"] and _forecast_cache["data"]:
-        return _forecast_cache["data"]
+    """Forecast every SKU that has sales. Uses the 30-minute memory cache."""
+    now = datetime.now(UTC)
+    cached = _forecast_cache["data"]
+    expires = _forecast_cache["expires"]
+    if expires and now < expires and cached:
+        return cached
 
     async with async_session() as session:
-        # 4 batch queries instead of 4N+1 per-SKU queries
-        sku_dfs = await _get_all_daily_sales(session)
-        titles = await _get_all_titles(session)
-        rules = await _get_all_reorder_rules(session)
-        stock = await _get_all_stock(session)
+        sku_frames = await _get_all_daily_sales(session)
+        titles_result = await session.execute(select(Product.sku, Product.title))
+        titles = {sku: (title or "Unknown") for sku, title in titles_result.all()}
+        rules_result = await session.execute(select(ReorderRule))
+        rules = {rule.sku: rule for rule in rules_result.scalars().all()}
+        stock = await positions_by_sku(session, "shiphero")
 
-    # Get the union of all SKUs that have sales data
-    skus_with_sales = set(sku_dfs.keys())
-
-    forecasts = []
-    for sku in skus_with_sales:
-        df = sku_dfs[sku]
-        if df.empty:
+    forecasts: list[SKUForecast] = []
+    for sku, frame in sku_frames.items():
+        if frame.empty:
             continue
-
-        title = titles.get(sku, "Unknown")
         rule = rules.get(sku)
-        current_stock = stock.get(sku, 0)
-        lead_time = rule.lead_time_days if rule else 14
-        safety_stock_val = rule.safety_stock if rule else 0
-
-        forecast = _generate_forecast_from_data(
-            sku, title, df, rule, current_stock, lead_time, safety_stock_val
-        )
-        forecasts.append(forecast)
+        position = stock.get(sku)
+        try:
+            forecasts.append(
+                _generate_forecast_from_data(
+                    sku,
+                    titles.get(sku, "Unknown"),
+                    frame,
+                    rule,
+                    position.available if position else 0,
+                    rule.lead_time_days if rule else 14,
+                    rule.safety_stock if rule else 0,
+                )
+            )
+        except Exception:
+            logger.exception("Forecast failed for %s", sku)
 
     _forecast_cache["data"] = forecasts
     _forecast_cache["expires"] = now + timedelta(minutes=CACHE_TTL_MINUTES)
-
+    below = sum(1 for item in forecasts if item.below_reorder_point)
     logger.info(
-        f"Generated forecasts for {len(forecasts)} SKUs, "
-        f"{sum(1 for f in forecasts if f.below_reorder_point)} below reorder point"
+        "Generated forecasts for %s SKUs, %s at or below reorder point",
+        len(forecasts),
+        below,
     )
     return forecasts
 
 
 async def update_reorder_rules() -> int:
-    """Update reorder rules from forecasts (called by scheduler only, not GET requests)."""
+    """Write forecast reorder points back onto reorder rules. Used by the nightly job."""
     forecasts = await generate_all_forecasts()
-
     upsert = get_upsert()
     async with async_session() as session:
-        for f in forecasts:
+        for forecast in forecasts:
             stmt = (
                 upsert(ReorderRule)
                 .values(
-                    sku=f.sku,
-                    reorder_point=f.reorder_point,
-                    reorder_quantity=f.suggested_reorder_qty,
-                    lead_time_days=f.lead_time_days,
-                    safety_stock=f.safety_stock,
+                    sku=forecast.sku,
+                    reorder_point=forecast.reorder_point,
+                    reorder_quantity=max(forecast.suggested_reorder_qty, 0),
+                    lead_time_days=forecast.lead_time_days,
+                    safety_stock=forecast.safety_stock,
                 )
                 .on_conflict_do_update(
                     index_elements=["sku"],
                     set_={
-                        "reorder_point": f.reorder_point,
-                        "reorder_quantity": f.suggested_reorder_qty,
+                        "reorder_point": forecast.reorder_point,
+                        "reorder_quantity": max(forecast.suggested_reorder_qty, 0),
                     },
                 )
             )
             await session.execute(stmt)
         await session.commit()
-
     return len(forecasts)
 
 
 async def get_reorder_alerts() -> list[SKUForecast]:
-    """Return only SKUs below their reorder point."""
+    """SKUs at or below their reorder point."""
     forecasts = await generate_all_forecasts()
-    return [f for f in forecasts if f.below_reorder_point]
+    return [item for item in forecasts if item.below_reorder_point]

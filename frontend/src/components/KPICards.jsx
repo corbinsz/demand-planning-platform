@@ -1,3 +1,4 @@
+import { formatCount, formatMoney } from '../format'
 import InfoTooltip from './shared/InfoTooltip'
 
 const cardStyle = {
@@ -58,8 +59,8 @@ function KPICard({ label, value, subtitle, color, tooltip }) {
 export default function KPICards({ data }) {
   if (!data) return null
 
-  const fmt = (n) => n?.toLocaleString() ?? '--'
-  const fmtMoney = (n) => `$${(n ?? 0).toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`
+  const fmt = formatCount
+  const fmtMoney = formatMoney
 
   const cards = [
     {

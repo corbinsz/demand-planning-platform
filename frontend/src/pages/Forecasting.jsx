@@ -109,7 +109,7 @@ export default function Forecasting() {
       <div style={{ marginBottom: '24px' }}>
         <h2 style={{ fontSize: '22px', fontWeight: 700, fontFamily: 'Poppins, sans-serif' }}>Demand Forecasting</h2>
         <p style={{ fontSize: '13px', color: 'var(--text-secondary)', marginTop: '4px' }}>
-          AI-powered demand predictions using exponential smoothing with seasonality detection. Tells you exactly what to reorder and when.
+          Holt-Winters demand predictions with a seasonality check. Each row says what to reorder and how soon stock runs out.
         </p>
       </div>
 

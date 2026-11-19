@@ -1,64 +1,115 @@
+"""Async SQLAlchemy engine, sessions, and schema bootstrap.
+
+The app creates tables on startup. Alembic is in the repo for later
+migrations; the running containers do not depend on a revision history.
+"""
+
 import os
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from collections.abc import AsyncIterator
+from typing import Any
+
+from sqlalchemy import func
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 from sqlalchemy.orm import DeclarativeBase
-from app.config import get_settings
+from sqlalchemy.pool import NullPool
+
+from app.config import Settings, get_settings
+
+_BACKEND_DIR = os.path.dirname(os.path.dirname(__file__))
+_DEFAULT_SQLITE_PATH = os.path.join(_BACKEND_DIR, "inventory.db")
+
+
+def resolve_database_url(settings: Settings) -> str:
+    """Choose the async SQLAlchemy URL.
+
+    An explicit ``sqlite`` URL is used as given, which is how tests point at
+    a temporary file. Otherwise ``USE_SQLITE=true`` (the local default) uses
+    a file next to the backend package. ``USE_SQLITE=false`` uses
+    ``DATABASE_URL``, which Docker Compose sets to PostgreSQL.
+    """
+    url = settings.database_url.strip()
+    if url.startswith("sqlite"):
+        return url
+    if settings.use_sqlite:
+        return f"sqlite+aiosqlite:///{_DEFAULT_SQLITE_PATH}"
+    return url
+
+
+def day_bucket(column):
+    """SQL calendar day of a timestamp.
+
+    ``date()`` exists on SQLite and PostgreSQL. ``strftime`` does not, so
+    forecasts and the sales chart used to fail as soon as Postgres was the
+    database.
+    """
+    return func.date(column)
+
 
 settings = get_settings()
+DATABASE_URL = resolve_database_url(settings)
+_is_sqlite = DATABASE_URL.startswith("sqlite")
 
-# Use SQLite for local dev — set USE_SQLITE=true in .env to force SQLite
-_db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "inventory.db")
-DATABASE_URL = settings.database_url
-if settings.use_sqlite or "sqlite" in DATABASE_URL:
-    DATABASE_URL = f"sqlite+aiosqlite:///{_db_path}"
-
-_is_sqlite = "sqlite" in DATABASE_URL
-
-_engine_kwargs = {"echo": False}
+_engine_kwargs: dict = {"echo": False}
 if _is_sqlite:
-    _engine_kwargs["connect_args"] = {"check_same_thread": False}
+    # NullPool closes connections after each use so tests can reset the file
+    # and so a sync seed script is not blocked by a checked-out connection.
+    _engine_kwargs["poolclass"] = NullPool
+    _engine_kwargs["connect_args"] = {"check_same_thread": False, "timeout": 30}
 
-engine = create_async_engine(DATABASE_URL, **_engine_kwargs)
-
-
-def get_upsert():
-    """Return the dialect-appropriate insert function for upserts."""
-    if _is_sqlite:
-        from sqlalchemy.dialects.sqlite import insert
-    else:
-        from sqlalchemy.dialects.postgresql import insert
-    return insert
-
+engine: AsyncEngine = create_async_engine(DATABASE_URL, **_engine_kwargs)
 async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 
+def get_upsert() -> Any:
+    """Dialect-specific INSERT ... ON CONFLICT helper."""
+    if _is_sqlite:
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+        return sqlite_insert
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    return pg_insert
+
+
 class Base(DeclarativeBase):
-    pass
+    """Declarative base for every table."""
 
 
-async def init_db():
-    """Create all tables and add any missing columns for existing DBs."""
+async def init_db() -> None:
+    """Create any missing tables and add columns introduced by the models."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(_add_missing_columns)
 
 
-def _add_missing_columns(conn):
-    """ALTER TABLE ADD COLUMN for any columns defined in models but missing from DB."""
+def _add_missing_columns(conn) -> None:
+    """``ALTER TABLE ADD COLUMN`` for model fields a dev database does not have yet.
+
+    This keeps a local SQLite file usable while the models change. It is not
+    a substitute for a reviewed migration on a database you care about.
+    """
     from sqlalchemy import inspect, text
+
     inspector = inspect(conn)
     for table_name, table in Base.metadata.tables.items():
         if not inspector.has_table(table_name):
             continue
-        existing = {c["name"] for c in inspector.get_columns(table_name)}
+        existing = {column["name"] for column in inspector.get_columns(table_name)}
         for col in table.columns:
             if col.name not in existing:
                 col_type = col.type.compile(conn.dialect)
-                conn.execute(text(
-                    f'ALTER TABLE {table_name} ADD COLUMN {col.name} {col_type}'
-                ))
+                conn.execute(
+                    text(f"ALTER TABLE {table_name} ADD COLUMN {col.name} {col_type}")
+                )
 
 
-async def get_db() -> AsyncSession:
+async def get_db() -> AsyncIterator[AsyncSession]:
+    """FastAPI dependency that commits on success and rolls back on error."""
     async with async_session() as session:
         try:
             yield session
@@ -66,5 +117,3 @@ async def get_db() -> AsyncSession:
         except Exception:
             await session.rollback()
             raise
-        finally:
-            await session.close()

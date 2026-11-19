@@ -14,5 +14,11 @@ Thumbs.db
 pgdata/
 *.db
 *.sqlite3
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+coverage/
 nul
 .claude/
