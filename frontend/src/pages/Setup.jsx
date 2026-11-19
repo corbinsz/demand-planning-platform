@@ -131,7 +131,7 @@ export default function Setup() {
       <div style={{ marginBottom: '28px' }}>
         <h2 style={{ fontSize: '22px', fontWeight: 700, fontFamily: 'Poppins, sans-serif' }}>Setup Guide</h2>
         <p style={{ fontSize: '13px', color: 'var(--text-secondary)', marginTop: '4px' }}>
-          Follow these steps to connect your integrations and start using Inventory Intel.
+          Follow these steps to connect your integrations and start using Demand Planning Platform.
         </p>
       </div>
 
@@ -139,7 +139,7 @@ export default function Setup() {
       <div style={{ ...sectionStyle, borderLeft: '4px solid var(--accent)' }}>
         <h3 style={h3Style}>How It Works</h3>
         <p style={{ color: 'var(--text-secondary)', fontSize: '14px', lineHeight: 1.8 }}>
-          Inventory Intel connects to your <strong>Shopify</strong> store and <strong>ShipHero</strong> warehouse
+          Demand Planning Platform connects to your <strong>Shopify</strong> store and <strong>ShipHero</strong> warehouse
           to create a unified view of your inventory. It automatically syncs product data, orders, and stock
           levels on a schedule, then forecasts demand from that order history and suggests what to reorder.
         </p>
@@ -166,7 +166,7 @@ export default function Setup() {
       {/* Shopify Integration */}
       <Accordion title={<><span style={stepNum}>1</span> Connect Shopify</>} defaultOpen={true}>
         <p style={{ color: 'var(--text-secondary)', fontSize: '14px', marginBottom: '16px' }}>
-          Inventory Intel uses Shopify's Admin REST API with a custom/private app access token to pull your
+          Demand Planning Platform uses Shopify's Admin REST API with a custom/private app access token to pull your
           product catalog, historical orders (up to 365 days), and real-time inventory levels.
         </p>
 
@@ -174,7 +174,7 @@ export default function Setup() {
         <ol style={{ color: 'var(--text-secondary)', fontSize: '13px', lineHeight: 2, paddingLeft: '20px', marginBottom: '16px' }}>
           <li>Go to your Shopify Admin &rarr; <strong>Settings</strong> &rarr; <strong>Apps and sales channels</strong></li>
           <li>Click <strong>Develop apps</strong> (top right), then <strong>Create an app</strong></li>
-          <li>Name it something like <em>"Inventory Intel"</em></li>
+          <li>Name it something like <em>"Demand Planning Platform"</em></li>
           <li>Go to <strong>Configuration</strong> tab and click <strong>Configure Admin API scopes</strong></li>
           <li>Enable these scopes:
             <div style={codeBlock}>
@@ -243,7 +243,7 @@ export default function Setup() {
         <ol style={{ color: 'var(--text-secondary)', fontSize: '13px', lineHeight: 2, paddingLeft: '20px', marginBottom: '16px' }}>
           <li>Log into <strong>ShipHero</strong> &rarr; <strong>My Account</strong> &rarr; <strong>API</strong></li>
           <li>Under <strong>Third Party Developer Access Tokens</strong>, click <strong>Generate Token</strong></li>
-          <li>Give it a name like <em>"Inventory Intel"</em></li>
+          <li>Give it a name like <em>"Demand Planning Platform"</em></li>
           <li>Copy the generated <strong>Bearer token</strong></li>
           <li>Make sure your ShipHero account has <strong>read access</strong> to:
             <div style={codeBlock}>
@@ -341,7 +341,7 @@ export default function Setup() {
       {/* Inventory Reconciliation */}
       <Accordion title={<><span style={stepNum}>4</span> Understanding Reconciliation</>}>
         <p style={{ color: 'var(--text-secondary)', fontSize: '14px', lineHeight: 1.8, marginBottom: '16px' }}>
-          Inventory Intel automatically reconciles data between Shopify and ShipHero every 4 hours. Here's how it works:
+          Demand Planning Platform automatically reconciles data between Shopify and ShipHero every 4 hours. Here's how it works:
         </p>
         <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
           {[

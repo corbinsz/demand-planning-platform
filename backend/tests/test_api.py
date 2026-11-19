@@ -1,13 +1,14 @@
 """HTTP coverage for the planning endpoints."""
 
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 from app.database import day_bucket
-from app.models.models import Order
+from app.models.models import Order, OrderLineItem
 from sqlalchemy import select
 from sqlalchemy.dialects import postgresql
 
-from tests.factories import add_order, add_product, add_rule, add_snapshot
+from tests.factories import _session, add_order, add_product, add_rule, add_snapshot
 
 
 def test_day_bucket_does_not_use_sqlite_strftime_on_postgres():
@@ -303,6 +304,61 @@ def test_reorder_rule_upsert_and_open_purchase_orders_without_a_token(client):
     open_orders = client.get("/api/purchase-orders").json()
     assert open_orders["items"] == []
     assert "error" not in open_orders
+
+
+def _add_daily_sales(sku: str, days: int, quantity: int) -> None:
+    """One order per day so the backtest has a contiguous daily series."""
+    start = datetime.now(UTC) - timedelta(days=days)
+    with _session() as session:
+        for offset in range(days):
+            order_id = f"BT-{sku}-{offset}"
+            session.add(
+                Order(
+                    order_id=order_id,
+                    shopify_order_id=order_id,
+                    created_at=start + timedelta(days=offset),
+                    total_price=Decimal("20.00"),
+                )
+            )
+            session.add(
+                OrderLineItem(
+                    line_item_id=f"BT-LI-{sku}-{offset}",
+                    order_id=order_id,
+                    sku=sku,
+                    quantity=quantity,
+                    price=Decimal("10.00"),
+                )
+            )
+        session.commit()
+
+
+def test_backtest_on_an_empty_catalog_has_no_scores(client):
+    body = client.get("/api/forecasting/backtest").json()
+    assert body["horizon_days"] == 30
+    assert body["sku_count"] == 0
+    assert body["evaluated_origins"] == 0
+    assert body["holt_winters"] == {"wape": None, "bias": None}
+    assert body["skus"] == []
+    assert "synthetic" in body["note"]
+
+
+def test_backtest_endpoint_scores_a_flat_history(client):
+    add_product("VE-FLAT", "Flat Tee")
+    _add_daily_sales("VE-FLAT", days=150, quantity=2)
+    first = client.get("/api/forecasting/backtest")
+    assert first.status_code == 200
+    body = first.json()
+    assert body["sku_count"] == 1
+    assert body["skipped_skus"] == 0
+    assert body["evaluated_origins"] == 1
+    row = body["skus"][0]
+    assert row["sku"] == "VE-FLAT"
+    assert row["title"] == "Flat Tee"
+    assert row["actual_units"] == 60
+    assert row["seasonal_naive"]["wape"] == 0
+    assert row["holt_winters"]["wape"] < 0.1
+    cached = client.get("/api/forecasting/backtest").json()
+    assert cached == body
 
 
 def test_connection_checks_do_not_call_out_with_placeholder_tokens(client):

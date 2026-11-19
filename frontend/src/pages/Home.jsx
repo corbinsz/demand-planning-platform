@@ -1,9 +1,10 @@
 import { useState, useEffect } from 'react'
 import { Link } from 'react-router-dom'
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, ResponsiveContainer, Tooltip } from 'recharts'
+import ForecastAccuracy from '../components/ForecastAccuracy'
 import KPICards from '../components/KPICards'
 import ReorderAlerts from '../components/ReorderAlerts'
-import { getDashboard, getSalesTrend, triggerShopifySync, triggerShipHeroSync } from '../services/api'
+import { getDashboard, getForecastBacktest, getSalesTrend, triggerShopifySync, triggerShipHeroSync } from '../services/api'
 
 function DataFreshness({ syncData }) {
   if (!syncData) return null
@@ -127,6 +128,9 @@ export default function Home() {
   const [dashboard, setDashboard] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
+  const [accuracy, setAccuracy] = useState(null)
+  const [accuracyLoading, setAccuracyLoading] = useState(true)
+  const [accuracyError, setAccuracyError] = useState(null)
 
   const loadDashboard = () => {
     setLoading(true)
@@ -140,6 +144,16 @@ export default function Home() {
   }
 
   useEffect(() => { loadDashboard() }, [])
+
+  useEffect(() => {
+    getForecastBacktest()
+      .then(r => { setAccuracy(r.data); setAccuracyError(null) })
+      .catch(err => {
+        setAccuracy(null)
+        setAccuracyError(err.response?.data?.detail || 'Forecast accuracy could not be computed.')
+      })
+      .finally(() => setAccuracyLoading(false))
+  }, [])
 
   return (
     <div>
@@ -183,7 +197,7 @@ export default function Home() {
             Stop guessing what to reorder.
           </h3>
           <p style={{ color: 'var(--text-secondary)', fontSize: '14px', marginBottom: '20px', maxWidth: 460, margin: '0 auto 20px' }}>
-            Inventory Intel forecasts demand from order history, flags SKUs that will stock out before a replenishment can arrive, and suggests a purchase quantity. Connect Shopify and ShipHero when you want live data. The bundled catalog is synthetic.
+            Demand Planning Platform forecasts demand from order history, flags SKUs that will stock out before a replenishment can arrive, and suggests a purchase quantity. Connect Shopify and ShipHero when you want live data. The bundled catalog is synthetic.
           </p>
           <Link to="/setup" style={{
             display: 'inline-block', padding: '10px 28px', borderRadius: 'var(--radius-sm)',
@@ -196,6 +210,10 @@ export default function Home() {
       ) : (
         <>
           <KPICards data={dashboard} />
+
+          <div style={{ marginTop: '28px' }}>
+            <ForecastAccuracy report={accuracy} loading={accuracyLoading} error={accuracyError} />
+          </div>
 
           <div style={{ marginTop: '28px' }}>
             <SalesTrendChart />

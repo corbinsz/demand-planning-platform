@@ -38,7 +38,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Inventory Intel — Demand Planning",
+    title="Demand Planning Platform",
     description=(
         "Demand forecasting and inventory planning for a Shopify store and a "
         "ShipHero warehouse. Predict what to reorder, when, and how much. "
