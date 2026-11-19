@@ -35,7 +35,7 @@ function DataFreshness({ syncData }) {
         display: 'inline-block',
       }} />
       {label}
-      {stale && <span style={{ fontWeight: 600 }}> (stale)</span>}
+      {stale && lastAt && <span style={{ fontWeight: 600 }}> (stale)</span>}
     </div>
   )
 }
@@ -147,7 +147,7 @@ export default function Home() {
         <div>
           <h2 style={{ fontSize: '22px', fontWeight: 700, fontFamily: 'Poppins, sans-serif' }}>Demand Planning Dashboard</h2>
           <p style={{ fontSize: '13px', color: 'var(--text-secondary)', marginTop: '4px', display: 'flex', alignItems: 'center', gap: '12px' }}>
-            Forecast demand, prevent stockouts, and automate reorders across Shopify + ShipHero
+            Synthetic Veldt &amp; Ember catalog. Forecasts use order history, not a live store.
             {dashboard && <DataFreshness syncData={dashboard} />}
           </p>
         </div>
@@ -183,7 +183,7 @@ export default function Home() {
             Stop guessing what to reorder.
           </h3>
           <p style={{ color: 'var(--text-secondary)', fontSize: '14px', marginBottom: '20px', maxWidth: 460, margin: '0 auto 20px' }}>
-            Inventory Intel uses AI-powered demand forecasting to predict exactly what you'll sell, when you'll run out, and how much to reorder. Connect your Shopify store and ShipHero warehouse to get started.
+            Inventory Intel forecasts demand from order history, flags SKUs that will stock out before a replenishment can arrive, and suggests a purchase quantity. Connect Shopify and ShipHero when you want live data. The bundled catalog is synthetic.
           </p>
           <Link to="/setup" style={{
             display: 'inline-block', padding: '10px 28px', borderRadius: 'var(--radius-sm)',

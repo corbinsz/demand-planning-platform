@@ -1,524 +1,488 @@
-"""
-Seed the database with demo data modeled after a DTC fitness brand (Otishi-style).
+"""Load a synthetic demo catalog.
 
-Run:  python -m seed
+The brand, product names, colorways, SKUs, warehouses, and prices are
+invented for this personal project. They are not a real company and they
+are not copied from a real catalog.
+
+Run from the backend directory:
+
+    python -m seed
+    python -m seed --if-empty
 """
 
+import argparse
 import asyncio
+import logging
 import random
-import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from app.database import async_session, init_db
+from app.logging_config import configure_logging
 from app.models.models import (
-    Product, Order, OrderLineItem, InventorySnapshot,
-    ReorderRule, PromotionalPeriod, JobLog,
+    InventorySnapshot,
+    Order,
+    OrderLineItem,
+    Product,
+    PromotionalPeriod,
+    ReorderRule,
 )
+from sqlalchemy import func, select, text
 
-random.seed(42)
+logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Product catalog — modeled after Otishi (DTC athletic / lifting brand)
-# ---------------------------------------------------------------------------
+DEMO_BRAND = "Veldt & Ember"
+SKU_PREFIX = "VE-"
 
-SHOE_SIZES = [
-    ("M4/W5.5", "4"),
-    ("M5/W6.5", "5"),
-    ("M6/W7.5", "6"),
-    ("M7/W8.5", "7"),
-    ("M8/W9.5", "8"),
-    ("M9/W10.5", "9"),
-    ("M10/W11.5", "10"),
-    ("M11/W12.5", "11"),
-    ("M12/W13.5", "12"),
-    ("M13/W14.5", "13"),
-    ("M14/W15.5", "14"),
-]
-
+SHOE_SIZES = ["US 7", "US 8", "US 9", "US 10", "US 11", "US 12", "US 13"]
 APPAREL_SIZES = ["S", "M", "L", "XL", "XXL"]
 
-COLORWAYS = {
-    "Amaru/Black":     "AMR",
-    "Andes Snow":      "AND",
-    "Moonstone Gray":  "MST",
-    "Petrified Sand":  "PSD",
+SHOE_COLORWAYS = {
+    "Fog Glass": "FG",
+    "Kiln Copper": "KC",
+    "Paper Moss": "PM",
+    "Ink Dune": "ID",
 }
+TEE_COLORS = {"Pebble": "PB", "Spruce": "SP"}
+CREW_COLORS = {"Char": "CH", "Oat": "OT"}
+SOCK_COLORS = {"Cloud": "CL", "Pine": "PN", "Sandbar": "SB"}
+CUP_COLORS = {"Tin": "TN", "Rust": "RS", "Cream": "CR"}
 
-APPAREL_COLORS = {
-    "Obsidian": "OBS",
-    "Brown":    "BRN",
-    "Black":    "BLK",
-    "White":    "WHT",
-    "Earth Tone": "ETN",
-    "Orange":   "ORG",
+WAREHOUSES = ["Demo North Warehouse", "Demo South Warehouse"]
+
+COLORWAY_WEIGHT = {
+    "Fog Glass": 1.8,
+    "Kiln Copper": 1.3,
+    "Paper Moss": 0.8,
+    "Ink Dune": 0.6,
 }
+SHOE_SIZE_WEIGHT = {
+    "US 7": 0.08,
+    "US 8": 0.14,
+    "US 9": 0.22,
+    "US 10": 0.22,
+    "US 11": 0.16,
+    "US 12": 0.11,
+    "US 13": 0.07,
+}
+APPAREL_SIZE_WEIGHT = {"S": 0.12, "M": 0.28, "L": 0.30, "XL": 0.20, "XXL": 0.10}
 
-WAREHOUSES = ["Primary - NJ", "West Coast - CA"]
 
+def _build_catalog() -> list[dict]:
+    """Return the invented Veldt & Ember catalog."""
+    products: list[dict] = []
 
-def _build_catalog():
-    """Return list of product dicts mirroring a real Otishi-style catalog."""
-    products = []
+    for colorway, code in SHOE_COLORWAYS.items():
+        parent = f"VE-SH-{code}"
+        for size in SHOE_SIZES:
+            size_code = size.replace("US ", "")
+            products.append(
+                {
+                    "sku": f"{parent}-{size_code}",
+                    "title": f'Veldt Trail Shoe "{colorway}" - {size}',
+                    "parent_sku": parent,
+                    "cost_price": Decimal("46.00"),
+                    "retail_price": Decimal("128.00"),
+                    "category": "footwear",
+                    "colorway": colorway,
+                    "size_code": size,
+                }
+            )
 
-    # ---- THE OTISHI 2.0 (hero shoe, 4 colorways) ----
-    shoe_colorways = [
-        ("Amaru/Black",    "AMR", [s for s in SHOE_SIZES if int(s[1]) >= 7]),
-        ("Andes Snow",     "AND", SHOE_SIZES),               # widest range = bestseller
-        ("Moonstone Gray", "MST", [s for s in SHOE_SIZES if int(s[1]) <= 10]),
-        ("Petrified Sand", "PSD", [s for s in SHOE_SIZES if int(s[1]) >= 8]),
-    ]
-    for cw_name, cw_code, sizes in shoe_colorways:
-        parent = f"OT-20-{cw_code}"
-        for size_label, size_code in sizes:
-            products.append({
-                "sku": f"OT-20-{cw_code}-{size_code}",
-                "title": f'The Otishi 2.0 "{cw_name}" - {size_label}',
-                "parent_sku": parent,
-                "cost_price": Decimal("28.00"),
-                "retail_price": Decimal("84.99"),
-                "category": "footwear",
-                "colorway": cw_name,
-                "size_code": size_code,
-            })
+    for color, code in TEE_COLORS.items():
+        for size in APPAREL_SIZES:
+            products.append(
+                {
+                    "sku": f"VE-TEE-{code}-{size}",
+                    "title": f"Ember Day Tee - {color} / {size}",
+                    "parent_sku": "VE-TEE",
+                    "cost_price": Decimal("14.00"),
+                    "retail_price": Decimal("42.00"),
+                    "category": "apparel",
+                    "colorway": color,
+                    "size_code": size,
+                }
+            )
 
-    # ---- LIFTING CLUB TEE ----
-    for color, cc in [("Obsidian", "OBS"), ("Brown", "BRN")]:
-        parent = "OT-LCT"
-        for sz in APPAREL_SIZES:
-            products.append({
-                "sku": f"OT-LCT-{cc}-{sz}",
-                "title": f"Lifting Club Tee - {color} / {sz}",
-                "parent_sku": parent,
-                "cost_price": Decimal("12.00"),
-                "retail_price": Decimal("44.99"),
-                "category": "apparel",
+    for color, code in CREW_COLORS.items():
+        for size in APPAREL_SIZES:
+            products.append(
+                {
+                    "sku": f"VE-CRW-{code}-{size}",
+                    "title": f"Ridge Crewneck - {color} / {size}",
+                    "parent_sku": "VE-CRW",
+                    "cost_price": Decimal("28.00"),
+                    "retail_price": Decimal("86.00"),
+                    "category": "apparel",
+                    "colorway": color,
+                    "size_code": size,
+                }
+            )
+
+    for color, code in SOCK_COLORS.items():
+        products.append(
+            {
+                "sku": f"VE-SOX-{code}",
+                "title": f"Wool Ankle Socks 3-Pack - {color}",
+                "parent_sku": "VE-SOX",
+                "cost_price": Decimal("6.00"),
+                "retail_price": Decimal("18.00"),
+                "category": "accessories",
                 "colorway": color,
-                "size_code": sz,
-            })
+                "size_code": "OS",
+            }
+        )
 
-    # ---- DEADLIFT UNIVERSITY SWEATS ----
-    for color, cc in [("Black", "BLK"), ("Brown", "BRN")]:
-        parent = "OT-DUS"
-        for sz in APPAREL_SIZES:
-            products.append({
-                "sku": f"OT-DUS-{cc}-{sz}",
-                "title": f"Deadlift University Sweats - {color} / {sz}",
-                "parent_sku": parent,
-                "cost_price": Decimal("22.00"),
-                "retail_price": Decimal("74.25"),
-                "category": "apparel",
+    products.append(
+        {
+            "sku": "VE-TOT-NT",
+            "title": "Canvas Market Tote - Natural",
+            "parent_sku": "VE-TOT",
+            "cost_price": Decimal("8.00"),
+            "retail_price": Decimal("32.00"),
+            "category": "accessories",
+            "colorway": "Natural",
+            "size_code": "OS",
+        }
+    )
+
+    for color, code in CUP_COLORS.items():
+        products.append(
+            {
+                "sku": f"VE-CUP-{code}",
+                "title": f"Enamel Camp Cup 12oz - {color}",
+                "parent_sku": "VE-CUP",
+                "cost_price": Decimal("7.00"),
+                "retail_price": Decimal("24.00"),
+                "category": "accessories",
                 "colorway": color,
-                "size_code": sz,
-            })
-
-    # ---- CREW SOCKS 3-PACK ----
-    for color, cc in [("White", "WHT"), ("Earth Tone", "ETN"), ("Black", "BLK")]:
-        products.append({
-            "sku": f"OT-SOX-{cc}",
-            "title": f"Crew Socks 3-Pack - {color}",
-            "parent_sku": "OT-SOX",
-            "cost_price": Decimal("5.00"),
-            "retail_price": Decimal("17.99"),
-            "category": "accessories",
-            "colorway": color,
-            "size_code": "OS",
-        })
-
-    # ---- FIGURE 8 LIFTING STRAPS ----
-    products.append({
-        "sku": "OT-F8S",
-        "title": "Figure 8 Lifting Straps",
-        "parent_sku": None,
-        "cost_price": Decimal("4.00"),
-        "retail_price": Decimal("18.75"),
-        "category": "accessories",
-        "colorway": "Black",
-        "size_code": "OS",
-    })
-
-    # ---- PERFECT SHAKER BOTTLE 28oz ----
-    for color, cc in [("Black", "BLK"), ("Orange", "ORG"), ("White", "WHT")]:
-        products.append({
-            "sku": f"OT-SHK-{cc}",
-            "title": f"Otishi Perfect Shaker Bottle 28oz - {color}",
-            "parent_sku": "OT-SHK",
-            "cost_price": Decimal("3.00"),
-            "retail_price": Decimal("9.99"),
-            "category": "accessories",
-            "colorway": color,
-            "size_code": "OS",
-        })
+                "size_code": "OS",
+            }
+        )
 
     return products
 
 
-# ---------------------------------------------------------------------------
-# Popularity / demand weights (mirrors typical DTC sales distribution)
-# ---------------------------------------------------------------------------
-
-# Shoe colorway popularity — Andes Snow is the hero, Petrified Sand is new
-COLORWAY_WEIGHT = {
-    "Andes Snow": 1.8,
-    "Amaru/Black": 1.3,
-    "Moonstone Gray": 0.8,
-    "Petrified Sand": 0.6,
-}
-
-# Shoe size distribution (bell curve peaking at M9-M10)
-SHOE_SIZE_WEIGHT = {
-    "4": 0.02, "5": 0.04, "6": 0.06, "7": 0.08, "8": 0.13,
-    "9": 0.18, "10": 0.18, "11": 0.13, "12": 0.08, "13": 0.06, "14": 0.04,
-}
-
-# Apparel size distribution
-APPAREL_SIZE_WEIGHT = {"S": 0.10, "M": 0.25, "L": 0.30, "XL": 0.25, "XXL": 0.10}
-
-# Category base demand (daily units across all variants)
-CATEGORY_DAILY_DEMAND = {
-    "footwear": 18,     # ~18 pairs/day average
-    "apparel": 12,      # ~12 units/day
-    "accessories": 8,   # ~8 units/day
-}
+def _product_weight(product: dict) -> float:
+    """Relative demand weight for one variant."""
+    if product["category"] == "footwear":
+        return COLORWAY_WEIGHT.get(product["colorway"], 1.0) * SHOE_SIZE_WEIGHT.get(
+            product["size_code"], 0.1
+        )
+    if product["category"] == "apparel":
+        size_weight = APPAREL_SIZE_WEIGHT.get(product["size_code"], 0.15)
+        if product["title"].startswith("Ember Day Tee"):
+            return size_weight * 1.4
+        return size_weight * 0.8
+    if "Socks" in product["title"]:
+        return 1.2
+    if "Tote" in product["title"]:
+        return 0.7
+    return 0.5
 
 
-def _product_weight(p):
-    """Relative demand weight for a product variant."""
-    if p["category"] == "footwear":
-        cw = COLORWAY_WEIGHT.get(p["colorway"], 1.0)
-        sz = SHOE_SIZE_WEIGHT.get(p["size_code"], 0.05)
-        return cw * sz
-    elif p["category"] == "apparel":
-        sz = APPAREL_SIZE_WEIGHT.get(p["size_code"], 0.15)
-        # Lifting Club Tee outsells Deadlift Sweats 2:1
-        if "Lifting Club" in p["title"]:
-            return sz * 1.4
-        return sz * 0.8
-    else:
-        # Accessories — socks > straps > shaker
-        if "Socks" in p["title"]:
-            return 1.2
-        elif "Strap" in p["title"]:
-            return 0.8
-        return 0.6
+def _seasonal_multiplier(moment: datetime) -> float:
+    """A simple retail calendar: a January bump, a summer bump, a late-year bump."""
+    month = moment.month
+    multiplier = 1.0
+    if month == 1:
+        multiplier *= 1.5
+    elif month == 2:
+        multiplier *= 0.85
+    elif month in (6, 7, 8):
+        multiplier *= 1.2
+    elif month == 11:
+        multiplier *= 1.45
+    elif month == 12:
+        multiplier *= 1.6
+    if moment.weekday() >= 5:
+        multiplier *= 1.15
+    return multiplier
 
 
-def _seasonal_multiplier(dt):
-    """Return demand multiplier for a given date (seasonal patterns for DTC fitness)."""
-    m = dt.month
-    dow = dt.weekday()
-    mult = 1.0
-
-    # New Year's resolution rush (January)
-    if m == 1:
-        mult *= 1.6
-    # Post-resolution dip (February)
-    elif m == 2:
-        mult *= 0.8
-    # Summer training season (June-August)
-    elif m in (6, 7, 8):
-        mult *= 1.25
-    # Back to school / fall training (September)
-    elif m == 9:
-        mult *= 1.15
-    # Black Friday / holiday (November-December)
-    elif m == 11:
-        mult *= 1.5
-    elif m == 12:
-        mult *= 1.7
-
-    # Weekend bump (people browse more on weekends)
-    if dow >= 5:
-        mult *= 1.2
-
-    return mult
-
-
-# ---------------------------------------------------------------------------
-# Data generators
-# ---------------------------------------------------------------------------
-
-def _generate_orders(products, days=365):
-    """Generate realistic order history."""
-    now = datetime.now(timezone.utc)
-    orders = []
-    weights = [_product_weight(p) for p in products]
+def _generate_orders(products: list[dict], days: int = 365) -> list[dict]:
+    """Build a year of orders. The random stream is local so imports stay quiet."""
+    rng = random.Random(42)
+    now = datetime.now(UTC)
+    weights = [_product_weight(product) for product in products]
     total_weight = sum(weights)
-    norm_weights = [w / total_weight for w in weights]
-
-    oid = 1000
-    lid = 10000
+    normalized = [weight / total_weight for weight in weights]
+    orders: list[dict] = []
+    order_number = 1000
+    line_number = 10000
 
     for day_offset in range(days, 0, -1):
-        dt = now - timedelta(days=day_offset)
-        mult = _seasonal_multiplier(dt)
-        base_orders = int(22 * mult)
-        num_orders = max(3, int(random.gauss(base_orders, base_orders * 0.25)))
-
-        for _ in range(num_orders):
-            oid += 1
-            # 1-3 items per order (typical DTC basket)
-            num_items = random.choices([1, 2, 3], weights=[0.55, 0.30, 0.15])[0]
-            selected_indices = random.choices(range(len(products)), weights=norm_weights, k=num_items)
-
+        moment = now - timedelta(days=day_offset)
+        multiplier = _seasonal_multiplier(moment)
+        base_orders = int(18 * multiplier)
+        order_count = max(3, int(rng.gauss(base_orders, base_orders * 0.25)))
+        for _ in range(order_count):
+            order_number += 1
+            item_count = rng.choices([1, 2, 3], weights=[0.6, 0.28, 0.12])[0]
+            chosen = rng.choices(range(len(products)), weights=normalized, k=item_count)
             line_items = []
             total = Decimal("0")
-            for idx in selected_indices:
-                p = products[idx]
-                qty = random.choices([1, 2], weights=[0.90, 0.10])[0]
-                price = p["retail_price"]
-                total += price * qty
-                lid += 1
-                line_items.append({
-                    "line_item_id": f"LI-{lid}",
-                    "sku": p["sku"],
-                    "quantity": qty,
-                    "price": price,
-                })
-
-            hour = random.randint(7, 23)
-            minute = random.randint(0, 59)
-            order_time = dt.replace(hour=hour, minute=minute, second=random.randint(0, 59))
-
-            orders.append({
-                "order_id": f"ORD-{oid}",
-                "shopify_order_id": f"SHP-{oid}",
-                "created_at": order_time,
-                "total_price": total,
-                "line_items": line_items,
-            })
-
+            for index in chosen:
+                product = products[index]
+                quantity = rng.choices([1, 2], weights=[0.92, 0.08])[0]
+                price = product["retail_price"]
+                total += price * quantity
+                line_number += 1
+                line_items.append(
+                    {
+                        "line_item_id": f"LI-{line_number}",
+                        "sku": product["sku"],
+                        "quantity": quantity,
+                        "price": price,
+                    }
+                )
+            orders.append(
+                {
+                    "order_id": f"ORD-{order_number}",
+                    "shopify_order_id": f"SHP-{order_number}",
+                    "created_at": moment.replace(
+                        hour=rng.randint(8, 21),
+                        minute=rng.randint(0, 59),
+                        second=rng.randint(0, 59),
+                    ),
+                    "total_price": total,
+                    "line_items": line_items,
+                }
+            )
     return orders
 
 
-def _generate_inventory(products):
-    """Generate current inventory snapshots from both ShipHero and Shopify."""
-    now = datetime.now(timezone.utc)
-    snapshots = []
-    sid = 5000
+def _generate_inventory(products: list[dict]) -> list[dict]:
+    """Current snapshots for both demo warehouses and both sources."""
+    rng = random.Random(7)
+    now = datetime.now(UTC)
+    snapshots: list[dict] = []
+    snapshot_number = 5000
 
-    for p in products:
-        w = _product_weight(p)
-        # Primary warehouse gets most stock, west coast gets ~40%
-        for wh_idx, wh in enumerate(WAREHOUSES):
-            sid += 1
-            wh_factor = 1.0 if wh_idx == 0 else 0.4
-
-            # Base stock inversely related to sales velocity (popular items sell through faster)
-            base = int((80 + random.gauss(0, 15)) * wh_factor)
-
-            # Realistic stock conditions
-            roll = random.random()
-            if p["category"] == "footwear" and p["size_code"] in ("4", "5", "13", "14"):
-                # Extreme sizes often sell out or have very low stock
-                if roll < 0.35:
+    for product in products:
+        for warehouse_index, warehouse in enumerate(WAREHOUSES):
+            snapshot_number += 1
+            warehouse_factor = 1.0 if warehouse_index == 0 else 0.45
+            base = max(0, int((70 + rng.gauss(0, 12)) * warehouse_factor))
+            roll = rng.random()
+            if product["category"] == "footwear" and product["size_code"] in (
+                "US 7",
+                "US 13",
+            ):
+                if roll < 0.3:
                     base = 0
-                elif roll < 0.55:
-                    base = random.randint(1, 5)
+                elif roll < 0.5:
+                    base = rng.randint(1, 4)
             elif roll < 0.06:
-                base = 0  # stockout
+                base = 0
             elif roll < 0.12:
-                base = random.randint(1, 8)  # low stock
+                base = rng.randint(1, 6)
             elif roll < 0.16:
-                base = random.randint(500, 900)  # excess (overordered)
+                base = rng.randint(400, 700)
 
-            allocated = min(int(base * random.uniform(0.05, 0.20)), base)
-            available = base - allocated
+            allocated = min(int(base * rng.uniform(0.05, 0.15)), base)
+            available = max(base - allocated, 0)
+            snapshots.append(
+                {
+                    "snapshot_id": f"SNAP-WH-{snapshot_number}",
+                    "sku": product["sku"],
+                    "quantity_on_hand": base,
+                    "quantity_allocated": allocated,
+                    "quantity_available": available,
+                    "warehouse": warehouse,
+                    "source": "shiphero",
+                    "recorded_at": now - timedelta(hours=rng.randint(0, 3)),
+                }
+            )
 
-            # ShipHero snapshot (source of truth)
-            snapshots.append({
-                "snapshot_id": f"SNAP-SH-{sid}",
-                "sku": p["sku"],
-                "quantity_on_hand": base,
-                "quantity_allocated": allocated,
-                "quantity_available": available,
-                "warehouse": wh,
-                "source": "shiphero",
-                "recorded_at": now - timedelta(hours=random.randint(0, 3)),
-            })
-
-            sid += 1
-            # Shopify snapshot (slight discrepancies for realism)
-            sp_on_hand = base + random.choice([0, 0, 0, 0, 0, -1, 1, -2, 2, -3])
-            sp_available = max(sp_on_hand - allocated, 0)
-            snapshots.append({
-                "snapshot_id": f"SNAP-SP-{sid}",
-                "sku": p["sku"],
-                "quantity_on_hand": sp_on_hand,
-                "quantity_allocated": allocated,
-                "quantity_available": sp_available,
-                "warehouse": wh,
-                "source": "shopify",
-                "recorded_at": now - timedelta(hours=random.randint(0, 6)),
-            })
-
+            snapshot_number += 1
+            # The store count is close to the warehouse count, not identical,
+            # so the reconciliation screen has something to flag.
+            store_on_hand = max(0, base + rng.choice([0, 0, 0, 0, 1, -1, 2, -2]))
+            store_available = max(store_on_hand - allocated, 0)
+            snapshots.append(
+                {
+                    "snapshot_id": f"SNAP-ST-{snapshot_number}",
+                    "sku": product["sku"],
+                    "quantity_on_hand": store_on_hand,
+                    "quantity_allocated": allocated,
+                    "quantity_available": store_available,
+                    "warehouse": warehouse,
+                    "source": "shopify",
+                    "recorded_at": now - timedelta(hours=rng.randint(1, 6)),
+                }
+            )
     return snapshots
 
 
-def _generate_reorder_rules(products):
-    """Generate reorder rules (footwear gets rules first, accessories last)."""
+def _generate_reorder_rules(products: list[dict]) -> list[dict]:
+    """Give most footwear, and some of everything else, a reorder rule."""
+    rng = random.Random(11)
     rules = []
-    seen = set()
-    for p in products:
-        if p["sku"] in seen:
+    thresholds = {"footwear": 0.8, "apparel": 0.6, "accessories": 0.45}
+    seen: set[str] = set()
+    for product in products:
+        if product["sku"] in seen:
             continue
-        seen.add(p["sku"])
-        # 80% of footwear, 60% of apparel, 40% of accessories have rules
-        threshold = {"footwear": 0.80, "apparel": 0.60, "accessories": 0.40}
-        if random.random() < threshold.get(p["category"], 0.5):
-            rules.append({
-                "sku": p["sku"],
-                "reorder_point": random.choice([15, 20, 25, 30]),
-                "reorder_quantity": random.choice([50, 100, 150, 200]),
-                "lead_time_days": 21 if p["category"] == "footwear" else 14,
-                "safety_stock": random.choice([5, 10, 15]),
-            })
+        seen.add(product["sku"])
+        if rng.random() >= thresholds.get(product["category"], 0.5):
+            continue
+        rules.append(
+            {
+                "sku": product["sku"],
+                "reorder_point": rng.choice([12, 18, 24, 30]),
+                "reorder_quantity": rng.choice([24, 48, 72]),
+                "lead_time_days": 21 if product["category"] == "footwear" else 12,
+                "safety_stock": rng.choice([4, 8, 12]),
+            }
+        )
     return rules
 
 
-def _generate_promotions():
-    """Generate promotions matching DTC fitness brand seasonality."""
-    now = datetime.now(timezone.utc)
+def _generate_promotions(now: datetime) -> list[dict]:
+    """A past event, an event in progress, and a future event."""
+    year = now.year
     return [
         {
-            "name": "Resolution Sale - 15% Off Sitewide",
-            "start_date": now.replace(month=1, day=1),
-            "end_date": now.replace(month=1, day=31),
+            "name": "Demo winter sample sale",
+            "start_date": datetime(year, 1, 6, tzinfo=UTC),
+            "end_date": datetime(year, 1, 20, tzinfo=UTC),
             "discount_pct": 15.0,
-            "notes": "New year, new goals. 15% off everything to kick off the year. Biggest acquisition month.",
+            "notes": "Synthetic past promotion. The forecast does not adjust for it.",
         },
         {
-            "name": "Summer Training Drop",
-            "start_date": (now - timedelta(days=240)).replace(day=1),
-            "end_date": (now - timedelta(days=225)).replace(day=15),
+            "name": "Demo week in progress",
+            "start_date": now - timedelta(days=2),
+            "end_date": now + timedelta(days=5),
             "discount_pct": 10.0,
-            "notes": "10% off footwear for summer training season launch",
+            "notes": "Synthetic current promotion so the page has an active row.",
         },
         {
-            "name": "Black Friday / Cyber Monday",
-            "start_date": now.replace(month=11, day=24) if now.month <= 11 else (now - timedelta(days=90)),
-            "end_date": now.replace(month=11, day=28) if now.month <= 11 else (now - timedelta(days=86)),
-            "discount_pct": 25.0,
-            "notes": "25% off sitewide. Highest AOV week of the year.",
+            "name": "Demo late-year sale",
+            "start_date": datetime(year, 11, 20, tzinfo=UTC),
+            "end_date": datetime(year, 11, 27, tzinfo=UTC),
+            "discount_pct": 20.0,
+            "notes": "Synthetic calendar entry. Not applied to the demand model.",
         },
         {
-            "name": "Spring Colorway Launch",
-            "start_date": now + timedelta(days=20),
-            "end_date": now + timedelta(days=27),
+            "name": "Demo upcoming color drop",
+            "start_date": now + timedelta(days=21),
+            "end_date": now + timedelta(days=28),
             "discount_pct": 0.0,
-            "notes": "New Otishi 2.0 colorway launch — no discount, hype-driven.",
+            "notes": "Future synthetic event with no discount.",
         },
     ]
 
 
-def _generate_job_logs():
-    """Generate recent job logs so the dashboard shows sync history."""
-    now = datetime.now(timezone.utc)
-    logs = []
-    for i, (job, hrs_ago) in enumerate([
-        ("shopify_sync", 2),
-        ("shiphero_sync", 1),
-        ("reconciliation", 1),
-        ("forecast_update", 8),
-    ]):
-        started = now - timedelta(hours=hrs_ago, minutes=random.randint(0, 15))
-        finished = started + timedelta(seconds=random.randint(3, 45))
-        logs.append({
-            "job_name": job,
-            "status": "success",
-            "started_at": started,
-            "finished_at": finished,
-            "records_processed": random.randint(50, 300),
-        })
-    return logs
+async def _product_count() -> int:
+    async with async_session() as session:
+        count = await session.scalar(select(func.count(Product.id)))
+        return int(count or 0)
 
 
-# ---------------------------------------------------------------------------
-# Main seed routine
-# ---------------------------------------------------------------------------
-
-async def seed(clear=True):
-    """Populate the database with demo data."""
+async def seed(clear: bool = True, if_empty: bool = False) -> None:
+    """Insert the synthetic catalog, a year of orders, and opening stock."""
     await init_db()
+    if if_empty and await _product_count() > 0:
+        logger.info("Database already has products; leaving demo data in place")
+        print("Database already has products; seed skipped.")
+        return
 
+    now = datetime.now(UTC)
     products = _build_catalog()
     orders = _generate_orders(products)
     inventory = _generate_inventory(products)
     reorder_rules = _generate_reorder_rules(products)
-    promotions = _generate_promotions()
-    job_logs = _generate_job_logs()
+    promotions = _generate_promotions(now)
+    line_count = sum(len(order["line_items"]) for order in orders)
 
-    print(f"  Products:           {len(products)}")
-    print(f"  Orders:             {len(orders)}")
-    print(f"  Order line items:   {sum(len(o['line_items']) for o in orders)}")
-    print(f"  Inventory snaps:    {len(inventory)}")
-    print(f"  Reorder rules:      {len(reorder_rules)}")
-    print(f"  Promotions:         {len(promotions)}")
-    print(f"  Job logs:           {len(job_logs)}")
-    print()
+    summary = (
+        f"{DEMO_BRAND}: {len(products)} SKUs, {len(orders)} orders, "
+        f"{line_count} line items, {len(inventory)} snapshots"
+    )
+    logger.info("Seeding %s", summary)
+    print(summary)
 
     async with async_session() as session:
         if clear:
-            from sqlalchemy import text
-            print("Clearing existing data...")
-            for table in [
-                "order_line_items", "orders", "inventory_snapshots",
-                "reorder_rules", "promotional_periods", "products", "job_logs",
-            ]:
+            logger.info("Clearing existing demo tables")
+            for table in (
+                "order_line_items",
+                "orders",
+                "inventory_snapshots",
+                "reorder_rules",
+                "promotional_periods",
+                "products",
+                "job_logs",
+            ):
                 await session.execute(text(f"DELETE FROM {table}"))
             await session.flush()
 
-        print("Inserting products...")
-        for p in products:
-            session.add(Product(
-                sku=p["sku"],
-                title=p["title"],
-                parent_sku=p["parent_sku"],
-                cost_price=p["cost_price"],
-            ))
+        for product in products:
+            session.add(
+                Product(
+                    sku=product["sku"],
+                    title=product["title"],
+                    parent_sku=product["parent_sku"],
+                    cost_price=product["cost_price"],
+                )
+            )
         await session.flush()
 
-        print("Inserting orders & line items...")
-        batch = 0
-        for o in orders:
-            session.add(Order(
-                order_id=o["order_id"],
-                shopify_order_id=o["shopify_order_id"],
-                created_at=o["created_at"],
-                total_price=o["total_price"],
-            ))
-            for li in o["line_items"]:
-                session.add(OrderLineItem(
-                    line_item_id=li["line_item_id"],
-                    order_id=o["order_id"],
-                    sku=li["sku"],
-                    quantity=li["quantity"],
-                    price=li["price"],
-                ))
-            batch += 1
-            if batch % 1000 == 0:
+        for index, order in enumerate(orders, start=1):
+            session.add(
+                Order(
+                    order_id=order["order_id"],
+                    shopify_order_id=order["shopify_order_id"],
+                    created_at=order["created_at"],
+                    total_price=order["total_price"],
+                )
+            )
+            for line in order["line_items"]:
+                session.add(
+                    OrderLineItem(
+                        line_item_id=line["line_item_id"],
+                        order_id=order["order_id"],
+                        sku=line["sku"],
+                        quantity=line["quantity"],
+                        price=line["price"],
+                    )
+                )
+            if index % 1000 == 0:
                 await session.flush()
-                print(f"  ...{batch}/{len(orders)} orders")
+                logger.info("Inserted %s/%s orders", index, len(orders))
 
-        print("Inserting inventory snapshots...")
-        for snap in inventory:
-            session.add(InventorySnapshot(**snap))
-
-        print("Inserting reorder rules...")
+        for snapshot in inventory:
+            session.add(InventorySnapshot(**snapshot))
         for rule in reorder_rules:
             session.add(ReorderRule(**rule))
-
-        print("Inserting promotions...")
         for promo in promotions:
             session.add(PromotionalPeriod(**promo))
-
-        print("Inserting job logs...")
-        for log in job_logs:
-            session.add(JobLog(**log))
-
         await session.commit()
-        print("\nDone! Database seeded successfully.")
+
+    logger.info("Seed finished")
+    print("Done. Synthetic demo data is loaded.")
+
+
+def main() -> None:
+    """CLI entry point."""
+    parser = argparse.ArgumentParser(
+        description="Load the synthetic Veldt & Ember demo catalog"
+    )
+    parser.add_argument(
+        "--if-empty",
+        action="store_true",
+        help="Do nothing when the products table already has rows",
+    )
+    parser.add_argument(
+        "--no-clear",
+        action="store_true",
+        help="Insert without deleting existing rows",
+    )
+    args = parser.parse_args()
+    configure_logging()
+    asyncio.run(seed(clear=not args.no_clear, if_empty=args.if_empty))
 
 
 if __name__ == "__main__":
-    asyncio.run(seed())
+    main()

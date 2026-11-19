@@ -1,49 +1,51 @@
+"""ABC classification, dead stock, and excess stock.
+
+ABC uses revenue over a lookback window. The SKU that crosses the 80% or
+95% line stays in the higher class. Stock is the latest snapshot in each
+warehouse, summed, so a second warehouse is not dropped.
+"""
+
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select, func, and_
+from sqlalchemy import and_, func, select
 
 from app.database import async_session
 from app.models.models import (
-    Product,
     Order,
     OrderLineItem,
-    InventorySnapshot,
+    Product,
 )
+from app.services.stock import positions_by_sku
 
 logger = logging.getLogger(__name__)
 
 
-def _latest_stock_subquery():
-    """Subquery for the latest snapshot ID per SKU from ShipHero."""
-    return (
-        select(
-            InventorySnapshot.sku,
-            func.max(InventorySnapshot.id).label("max_id"),
-        )
-        .where(InventorySnapshot.source == "shiphero")
-        .group_by(InventorySnapshot.sku)
-        .subquery()
-    )
+def assign_abc_class(cumulative_before_pct: float) -> str:
+    """Pareto class from the revenue share already classified.
+
+    ``cumulative_before_pct`` is the percent of revenue from SKUs already
+    placed, before this one. The SKU that crosses 80% stays A, and the SKU
+    that crosses 95% stays B.
+    """
+    if cumulative_before_pct < 80:
+        return "A"
+    if cumulative_before_pct < 95:
+        return "B"
+    return "C"
 
 
 async def _get_stock_map(session) -> dict[str, int]:
-    """Get latest stock per SKU using only the most recent snapshot."""
-    latest = _latest_stock_subquery()
-    result = await session.execute(
-        select(
-            InventorySnapshot.sku,
-            InventorySnapshot.quantity_available,
-        )
-        .join(latest, InventorySnapshot.id == latest.c.max_id)
-    )
-    return {r[0]: int(r[1] or 0) for r in result.all()}
+    """Available units per SKU from the latest ShipHero snapshot in each warehouse."""
+    positions = await positions_by_sku(session, "shiphero")
+    return {sku: position.available for sku, position in positions.items()}
 
 
 # ---------------------------------------------------------------------------
 # ABC Classification
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class ABCItem:
@@ -64,7 +66,7 @@ async def compute_abc_classification(days: int = 90) -> list[ABCItem]:
     Classify SKUs using revenue-based Pareto (80/15/5) over the last N days.
     A = top 80% of revenue, B = next 15%, C = bottom 5%.
     """
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    cutoff = datetime.now(UTC) - timedelta(days=days)
 
     async with async_session() as session:
         # Revenue and units per SKU
@@ -102,32 +104,29 @@ async def compute_abc_classification(days: int = 90) -> list[ABCItem]:
         rev = float(revenue or 0)
         qty = int(units or 0)
         pct = (rev / total_revenue) * 100
+        abc_class = assign_abc_class(cumulative)
         cumulative += pct
-
-        # ABC thresholds: A=0-80%, B=80-95%, C=95-100%
-        if cumulative <= 80:
-            abc_class = "A"
-        elif cumulative <= 95:
-            abc_class = "B"
-        else:
-            abc_class = "C"
 
         daily_velocity = round(qty / max(days, 1), 2)
         current_stock = stock_map.get(sku, 0)
-        days_of_stock = round(current_stock / daily_velocity, 1) if daily_velocity > 0 else None
+        days_of_stock = (
+            round(current_stock / daily_velocity, 1) if daily_velocity > 0 else None
+        )
 
-        items.append(ABCItem(
-            sku=sku,
-            title=title_map.get(sku, "Unknown"),
-            total_revenue=round(rev, 2),
-            total_units=qty,
-            pct_of_revenue=round(pct, 2),
-            cumulative_pct=round(cumulative, 2),
-            abc_class=abc_class,
-            current_stock=current_stock,
-            days_of_stock=days_of_stock,
-            daily_velocity=daily_velocity,
-        ))
+        items.append(
+            ABCItem(
+                sku=sku,
+                title=title_map.get(sku, "Unknown"),
+                total_revenue=round(rev, 2),
+                total_units=qty,
+                pct_of_revenue=round(pct, 2),
+                cumulative_pct=round(cumulative, 2),
+                abc_class=abc_class,
+                current_stock=current_stock,
+                days_of_stock=days_of_stock,
+                daily_velocity=daily_velocity,
+            )
+        )
 
     logger.info(
         f"ABC classification: {sum(1 for i in items if i.abc_class == 'A')} A, "
@@ -140,9 +139,11 @@ async def compute_abc_classification(days: int = 90) -> list[ABCItem]:
 async def abc_summary(days: int = 90) -> dict:
     """Return summary counts and revenue by ABC class."""
     items = await compute_abc_classification(days=days)
-    summary = {"A": {"count": 0, "revenue": 0, "units": 0},
-               "B": {"count": 0, "revenue": 0, "units": 0},
-               "C": {"count": 0, "revenue": 0, "units": 0}}
+    summary: dict[str, dict[str, float]] = {
+        "A": {"count": 0, "revenue": 0.0, "units": 0},
+        "B": {"count": 0, "revenue": 0.0, "units": 0},
+        "C": {"count": 0, "revenue": 0.0, "units": 0},
+    }
     for item in items:
         c = item.abc_class
         summary[c]["count"] += 1
@@ -152,7 +153,9 @@ async def abc_summary(days: int = 90) -> dict:
     total_skus = len(items)
     for c in summary:
         summary[c]["revenue"] = round(summary[c]["revenue"], 2)
-        summary[c]["pct_of_skus"] = round((summary[c]["count"] / total_skus) * 100, 1) if total_skus else 0
+        summary[c]["pct_of_skus"] = (
+            round((summary[c]["count"] / total_skus) * 100, 1) if total_skus else 0
+        )
 
     return {"summary": summary, "total_skus": total_skus, "items": items}
 
@@ -160,6 +163,7 @@ async def abc_summary(days: int = 90) -> dict:
 # ---------------------------------------------------------------------------
 # Dead Stock Report
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class DeadStockItem:
@@ -183,7 +187,7 @@ async def dead_stock_report(
     Identify dead stock: SKUs with inventory on hand but very low or zero
     sales in the last N days.
     """
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     cutoff_90d = now - timedelta(days=90)
 
     async with async_session() as session:
@@ -236,8 +240,9 @@ async def dead_stock_report(
 
         # Product titles
         products = await session.execute(
-            select(Product.sku, Product.title)
-            .where(Product.sku.in_(list(stocked_skus.keys())))
+            select(Product.sku, Product.title).where(
+                Product.sku.in_(list(stocked_skus.keys()))
+            )
         )
         title_map = {r[0]: r[1] for r in products.all()}
 
@@ -253,8 +258,8 @@ async def dead_stock_report(
         last_date = last_sale_map.get(sku)
         if last_date:
             # Normalize to naive UTC for safe comparison
-            if hasattr(last_date, 'tzinfo') and last_date.tzinfo:
-                last_date_naive = last_date.astimezone(timezone.utc).replace(tzinfo=None)
+            if hasattr(last_date, "tzinfo") and last_date.tzinfo:
+                last_date_naive = last_date.astimezone(UTC).replace(tzinfo=None)
             else:
                 last_date_naive = last_date
             days_since = (now_naive - last_date_naive).days
@@ -265,7 +270,9 @@ async def dead_stock_report(
         velocity = round(units_90d / 90, 2)
 
         # Filter: dead stock = no sales in N days OR never sold
-        is_dead = (days_since is not None and days_since >= no_sale_days) or days_since is None
+        is_dead = (
+            days_since is not None and days_since >= no_sale_days
+        ) or days_since is None
         # Also include very slow movers: < 1 unit per month with stock > 30 days supply
         is_slow = velocity < 0.033 and stock > 10
 
@@ -286,18 +293,20 @@ async def dead_stock_report(
         else:
             recommendation = "Review pricing"
 
-        items.append(DeadStockItem(
-            sku=sku,
-            title=title_map.get(sku, "Unknown"),
-            current_stock=stock,
-            inventory_value=inv_value,
-            last_sold_date=last_date.isoformat() if last_date else None,
-            days_since_last_sale=days_since,
-            total_units_sold_90d=units_90d,
-            daily_velocity=velocity,
-            abc_class=abc_map.get(sku, "C"),
-            recommendation=recommendation,
-        ))
+        items.append(
+            DeadStockItem(
+                sku=sku,
+                title=title_map.get(sku, "Unknown"),
+                current_stock=stock,
+                inventory_value=inv_value,
+                last_sold_date=last_date.isoformat() if last_date else None,
+                days_since_last_sale=days_since,
+                total_units_sold_90d=units_90d,
+                daily_velocity=velocity,
+                abc_class=abc_map.get(sku, "C"),
+                recommendation=recommendation,
+            )
+        )
 
     # Sort by inventory value descending (biggest $ at risk first)
     items.sort(key=lambda x: x.inventory_value, reverse=True)
@@ -309,6 +318,7 @@ async def dead_stock_report(
 # ---------------------------------------------------------------------------
 # Excess Stock Report
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class ExcessStockItem:
@@ -334,7 +344,7 @@ async def excess_stock_report(target_days_of_stock: int = 90) -> list[ExcessStoc
         stock_map = await _get_stock_map(session)
 
         # Sales velocity from last 90 days
-        cutoff = datetime.now(timezone.utc) - timedelta(days=90)
+        cutoff = datetime.now(UTC) - timedelta(days=90)
         velocity_result = await session.execute(
             select(
                 OrderLineItem.sku,
@@ -344,15 +354,16 @@ async def excess_stock_report(target_days_of_stock: int = 90) -> list[ExcessStoc
             .where(Order.created_at >= cutoff)
             .group_by(OrderLineItem.sku)
         )
-        velocity_map = {r[0]: round(int(r[1] or 0) / 90, 2) for r in velocity_result.all()}
+        velocity_map = {
+            r[0]: round(int(r[1] or 0) / 90, 2) for r in velocity_result.all()
+        }
 
         # Average price
         avg_price = await session.execute(
             select(
                 OrderLineItem.sku,
                 func.avg(OrderLineItem.price).label("avg_price"),
-            )
-            .group_by(OrderLineItem.sku)
+            ).group_by(OrderLineItem.sku)
         )
         price_map = {r[0]: float(r[1] or 0) for r in avg_price.all()}
 
@@ -396,21 +407,25 @@ async def excess_stock_report(target_days_of_stock: int = 90) -> list[ExcessStoc
             else:
                 recommendation = "Consider markdown"
 
-        items.append(ExcessStockItem(
-            sku=sku,
-            title=title_map.get(sku, "Unknown"),
-            current_stock=stock,
-            daily_velocity=velocity,
-            days_of_stock=days_of_stock,
-            excess_units=excess,
-            excess_value=excess_value,
-            target_days=target_days_of_stock,
-            abc_class=abc,
-            recommendation=recommendation,
-        ))
+        items.append(
+            ExcessStockItem(
+                sku=sku,
+                title=title_map.get(sku, "Unknown"),
+                current_stock=stock,
+                daily_velocity=velocity,
+                days_of_stock=days_of_stock,
+                excess_units=excess,
+                excess_value=excess_value,
+                target_days=target_days_of_stock,
+                abc_class=abc,
+                recommendation=recommendation,
+            )
+        )
 
     # Sort by excess value descending
     items.sort(key=lambda x: x.excess_value, reverse=True)
 
-    logger.info(f"Excess stock report: {len(items)} SKUs, ${sum(i.excess_value for i in items):,.2f} total excess value")
+    logger.info(
+        f"Excess stock report: {len(items)} SKUs, ${sum(i.excess_value for i in items):,.2f} total excess value"
+    )
     return items

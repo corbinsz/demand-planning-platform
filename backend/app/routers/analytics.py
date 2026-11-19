@@ -3,12 +3,12 @@ import io
 import logging
 from dataclasses import asdict
 
-from fastapi import APIRouter, Query, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
 from app.services.analytics import (
-    compute_abc_classification,
     abc_summary,
+    compute_abc_classification,
     dead_stock_report,
     excess_stock_report,
 )
@@ -28,7 +28,9 @@ async def get_abc_classification(
         data = await abc_summary(days=days)
     except Exception as e:
         logger.error(f"ABC classification failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to compute ABC classification: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to compute ABC classification: {e}"
+        )
 
     all_items = data["items"]
     total = len(all_items)
@@ -48,7 +50,9 @@ async def get_abc_classification(
 
 @router.get("/dead-stock")
 async def get_dead_stock(
-    no_sale_days: int = Query(60, ge=14, le=365, description="Days without sales to consider dead"),
+    no_sale_days: int = Query(
+        60, ge=14, le=365, description="Days without sales to consider dead"
+    ),
     min_stock: int = Query(1, ge=1, description="Minimum stock to include"),
     page: int = Query(1, ge=1),
     per_page: int = Query(50, ge=1, le=200),
@@ -58,7 +62,9 @@ async def get_dead_stock(
         items = await dead_stock_report(no_sale_days=no_sale_days, min_stock=min_stock)
     except Exception as e:
         logger.error(f"Dead stock report failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to compute dead stock report: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to compute dead stock report: {e}"
+        )
     total_value = sum(i.inventory_value for i in items)
     total_units = sum(i.current_stock for i in items)
 
@@ -79,7 +85,9 @@ async def get_dead_stock(
 
 @router.get("/excess-stock")
 async def get_excess_stock(
-    target_days: int = Query(90, ge=30, le=365, description="Target days of stock coverage"),
+    target_days: int = Query(
+        90, ge=30, le=365, description="Target days of stock coverage"
+    ),
     page: int = Query(1, ge=1),
     per_page: int = Query(50, ge=1, le=200),
 ):
@@ -88,7 +96,9 @@ async def get_excess_stock(
         items = await excess_stock_report(target_days_of_stock=target_days)
     except Exception as e:
         logger.error(f"Excess stock report failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to compute excess stock report: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to compute excess stock report: {e}"
+        )
     total_excess_value = sum(i.excess_value for i in items)
     total_excess_units = sum(i.excess_units for i in items)
 
@@ -111,6 +121,7 @@ async def get_excess_stock(
 # CSV Export Endpoints
 # ---------------------------------------------------------------------------
 
+
 def _csv_response(buf: io.StringIO, filename: str) -> StreamingResponse:
     buf.seek(0)
     return StreamingResponse(
@@ -128,9 +139,35 @@ async def export_abc_csv(
     items = await compute_abc_classification(days=days)
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["SKU", "Title", "Class", "Revenue", "Units Sold", "% of Revenue", "Cumulative %", "Stock", "Days of Stock", "Velocity/day"])
+    writer.writerow(
+        [
+            "SKU",
+            "Title",
+            "Class",
+            "Revenue",
+            "Units Sold",
+            "% of Revenue",
+            "Cumulative %",
+            "Stock",
+            "Days of Stock",
+            "Velocity/day",
+        ]
+    )
     for i in items:
-        writer.writerow([i.sku, i.title, i.abc_class, i.total_revenue, i.total_units, i.pct_of_revenue, i.cumulative_pct, i.current_stock, i.days_of_stock or "", i.daily_velocity])
+        writer.writerow(
+            [
+                i.sku,
+                i.title,
+                i.abc_class,
+                i.total_revenue,
+                i.total_units,
+                i.pct_of_revenue,
+                i.cumulative_pct,
+                i.current_stock,
+                i.days_of_stock or "",
+                i.daily_velocity,
+            ]
+        )
     return _csv_response(buf, "abc-classification.csv")
 
 
@@ -143,9 +180,35 @@ async def export_dead_stock_csv(
     items = await dead_stock_report(no_sale_days=no_sale_days, min_stock=min_stock)
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["SKU", "Title", "Class", "Stock", "Value", "Last Sold", "Days Silent", "Units (90d)", "Velocity/day", "Recommendation"])
+    writer.writerow(
+        [
+            "SKU",
+            "Title",
+            "Class",
+            "Stock",
+            "Value",
+            "Last Sold",
+            "Days Silent",
+            "Units (90d)",
+            "Velocity/day",
+            "Recommendation",
+        ]
+    )
     for i in items:
-        writer.writerow([i.sku, i.title, i.abc_class, i.current_stock, i.inventory_value, i.last_sold_date or "Never", i.days_since_last_sale or "Never", i.total_units_sold_90d, i.daily_velocity, i.recommendation])
+        writer.writerow(
+            [
+                i.sku,
+                i.title,
+                i.abc_class,
+                i.current_stock,
+                i.inventory_value,
+                i.last_sold_date or "Never",
+                i.days_since_last_sale or "Never",
+                i.total_units_sold_90d,
+                i.daily_velocity,
+                i.recommendation,
+            ]
+        )
     return _csv_response(buf, "dead-stock.csv")
 
 
@@ -157,7 +220,33 @@ async def export_excess_stock_csv(
     items = await excess_stock_report(target_days_of_stock=target_days)
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["SKU", "Title", "Class", "Stock", "Velocity/day", "Days of Stock", "Target Days", "Excess Units", "Excess Value", "Recommendation"])
+    writer.writerow(
+        [
+            "SKU",
+            "Title",
+            "Class",
+            "Stock",
+            "Velocity/day",
+            "Days of Stock",
+            "Target Days",
+            "Excess Units",
+            "Excess Value",
+            "Recommendation",
+        ]
+    )
     for i in items:
-        writer.writerow([i.sku, i.title, i.abc_class, i.current_stock, i.daily_velocity, i.days_of_stock, i.target_days, i.excess_units, i.excess_value, i.recommendation])
+        writer.writerow(
+            [
+                i.sku,
+                i.title,
+                i.abc_class,
+                i.current_stock,
+                i.daily_velocity,
+                i.days_of_stock,
+                i.target_days,
+                i.excess_units,
+                i.excess_value,
+                i.recommendation,
+            ]
+        )
     return _csv_response(buf, "excess-stock.csv")

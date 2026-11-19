@@ -141,7 +141,7 @@ export default function Setup() {
         <p style={{ color: 'var(--text-secondary)', fontSize: '14px', lineHeight: 1.8 }}>
           Inventory Intel connects to your <strong>Shopify</strong> store and <strong>ShipHero</strong> warehouse
           to create a unified view of your inventory. It automatically syncs product data, orders, and stock
-          levels on a schedule, then uses AI-powered demand forecasting to tell you exactly what to reorder and when.
+          levels on a schedule, then forecasts demand from that order history and suggests what to reorder.
         </p>
         <div style={{ display: 'flex', gap: '16px', marginTop: '20px', flexWrap: 'wrap' }}>
           {[
@@ -191,11 +191,11 @@ export default function Setup() {
 
         <h4 style={{ fontSize: '14px', fontWeight: 600, marginBottom: '10px' }}>Step 2: Add to Environment</h4>
         <p style={{ color: 'var(--text-secondary)', fontSize: '13px', marginBottom: '8px' }}>
-          Open <code style={{ background: 'var(--bg-primary)', padding: '1px 6px', borderRadius: 4, fontSize: '12px' }}>backend/.env</code> and set:
+          Open <code style={{ background: 'var(--bg-primary)', padding: '1px 6px', borderRadius: 4, fontSize: '12px' }}>backend/.env</code> (see <code style={{ background: 'var(--bg-primary)', padding: '1px 6px', borderRadius: 4, fontSize: '12px' }}>.env.example</code>) and set:
         </p>
         <div style={codeBlock}>
           SHOPIFY_STORE_DOMAIN=your-store.myshopify.com{'\n'}
-          SHOPIFY_ACCESS_TOKEN=shpat_xxxxxxxxxxxxxxxxxxxxx
+          SHOPIFY_ACCESS_TOKEN=replace-me
         </div>
         <div style={{
           background: 'var(--warning-bg)', border: '1px solid var(--warning)',
@@ -375,7 +375,7 @@ export default function Setup() {
             { title: 'Exponential Smoothing', desc: 'Holt-Winters exponential smoothing with additive trend is applied. If seasonality is detected, seasonal components are added.' },
             { title: 'Seasonality Detection', desc: 'Autocorrelation at 7-day and 30-day lags detects repeating patterns. If correlation > 0.3, seasonal forecasting is used.' },
             { title: 'Reorder Point', desc: 'Calculated as: (Average Daily Sales x Lead Time Days) + Safety Stock. SKUs below this threshold trigger reorder alerts.' },
-            { title: 'Suggested Quantity', desc: 'Based on an 8-week supply target: (Daily Velocity x 56 days) - Current Stock. Minimum is the configured reorder quantity.' },
+            { title: 'Suggested Quantity', desc: 'Eight weeks of recent daily demand, minus units already on hand. The saved reorder quantity is a floor only when stock is already at or below the reorder point.' },
           ].map((item, i) => (
             <div key={i} style={{ display: 'flex', gap: '12px', padding: '12px 16px', background: 'var(--bg-primary)', borderRadius: 'var(--radius-sm)' }}>
               <div style={{ ...stepNum, background: 'var(--accent-light)', color: 'var(--accent)', fontSize: '11px', width: 24, height: 24, marginRight: 0, marginTop: 2 }}>
@@ -426,16 +426,16 @@ export default function Setup() {
           <span style={{ color: '#89b4fa' }}># Database (auto-configured for SQLite locally)</span>{'\n'}
           DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/db{'\n'}
           {'\n'}
-          <span style={{ color: '#89b4fa' }}># Shopify (required)</span>{'\n'}
+          <span style={{ color: '#89b4fa' }}># Shopify (optional — the demo runs without it)</span>{'\n'}
           SHOPIFY_STORE_DOMAIN=your-store.myshopify.com{'\n'}
-          SHOPIFY_ACCESS_TOKEN=shpat_xxxxxxxxxxxxxxxxxxxxx{'\n'}
+          SHOPIFY_ACCESS_TOKEN=replace-me{'\n'}
           {'\n'}
-          <span style={{ color: '#89b4fa' }}># ShipHero (required)</span>{'\n'}
+          <span style={{ color: '#89b4fa' }}># ShipHero (optional — the demo runs without it)</span>{'\n'}
           SHIPHERO_API_TOKEN=your_bearer_token{'\n'}
           {'\n'}
           <span style={{ color: '#89b4fa' }}># App settings</span>{'\n'}
           SECRET_KEY=random-secret-string{'\n'}
-          CORS_ORIGINS=http://localhost:3000,http://localhost:5173{'\n'}
+          CORS_ORIGINS=http://localhost:8080,http://localhost:5173{'\n'}
           LOG_LEVEL=INFO
         </div>
       </Accordion>

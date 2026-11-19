@@ -1,8 +1,9 @@
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import httpx
+
 from app.config import get_settings
 from app.database import async_session, get_upsert
 from app.models.models import InventorySnapshot
@@ -26,7 +27,7 @@ async def _graphql_request(
     query: str, variables: dict | None = None, client: httpx.AsyncClient | None = None
 ) -> dict:
     """Execute a GraphQL request against ShipHero API with retry + exponential backoff."""
-    payload = {"query": query}
+    payload: dict[str, object] = {"query": query}
     if variables:
         payload["variables"] = variables
 
@@ -37,14 +38,22 @@ async def _graphql_request(
 
                 if resp.status_code == 429:
                     retry_after = resp.headers.get("Retry-After")
-                    wait = float(retry_after) if retry_after else BASE_BACKOFF * (2 ** attempt)
-                    logger.warning(f"ShipHero 429 rate limited, retrying in {wait:.1f}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                    wait = (
+                        float(retry_after)
+                        if retry_after
+                        else BASE_BACKOFF * (2**attempt)
+                    )
+                    logger.warning(
+                        f"ShipHero 429 rate limited, retrying in {wait:.1f}s (attempt {attempt + 1}/{MAX_RETRIES})"
+                    )
                     await asyncio.sleep(wait)
                     continue
 
                 if resp.status_code >= 500 and attempt < MAX_RETRIES - 1:
-                    wait = BASE_BACKOFF * (2 ** attempt)
-                    logger.warning(f"ShipHero {resp.status_code} server error, retrying in {wait:.1f}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                    wait = BASE_BACKOFF * (2**attempt)
+                    logger.warning(
+                        f"ShipHero {resp.status_code} server error, retrying in {wait:.1f}s (attempt {attempt + 1}/{MAX_RETRIES})"
+                    )
                     await asyncio.sleep(wait)
                     continue
 
@@ -54,10 +63,19 @@ async def _graphql_request(
                 # ShipHero returns throttle info in the response body
                 complexity = data.get("data", {})
                 for key in complexity:
-                    if isinstance(complexity[key], dict) and "complexity" in complexity[key]:
+                    if (
+                        isinstance(complexity[key], dict)
+                        and "complexity" in complexity[key]
+                    ):
                         remaining = complexity[key].get("complexity")
-                        if remaining is not None and isinstance(remaining, (int, float)) and remaining < 100:
-                            logger.info(f"ShipHero API complexity low ({remaining}), adding 1s delay")
+                        if (
+                            remaining is not None
+                            and isinstance(remaining, (int, float))
+                            and remaining < 100
+                        ):
+                            logger.info(
+                                f"ShipHero API complexity low ({remaining}), adding 1s delay"
+                            )
                             await asyncio.sleep(1.0)
                         break
 
@@ -65,8 +83,10 @@ async def _graphql_request(
                     error_msg = data["errors"][0].get("message", "Unknown error")
                     # Retry on throttle errors embedded in GraphQL response
                     if "throttle" in error_msg.lower() or "rate" in error_msg.lower():
-                        wait = BASE_BACKOFF * (2 ** attempt)
-                        logger.warning(f"ShipHero GraphQL throttle error, retrying in {wait:.1f}s: {error_msg}")
+                        wait = BASE_BACKOFF * (2**attempt)
+                        logger.warning(
+                            f"ShipHero GraphQL throttle error, retrying in {wait:.1f}s: {error_msg}"
+                        )
                         await asyncio.sleep(wait)
                         continue
                     logger.error(f"ShipHero GraphQL errors: {data['errors']}")
@@ -76,8 +96,10 @@ async def _graphql_request(
 
             except httpx.TimeoutException:
                 if attempt < MAX_RETRIES - 1:
-                    wait = BASE_BACKOFF * (2 ** attempt)
-                    logger.warning(f"ShipHero request timeout, retrying in {wait:.1f}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                    wait = BASE_BACKOFF * (2**attempt)
+                    logger.warning(
+                        f"ShipHero request timeout, retrying in {wait:.1f}s (attempt {attempt + 1}/{MAX_RETRIES})"
+                    )
                     await asyncio.sleep(wait)
                     continue
                 raise
@@ -202,7 +224,7 @@ async def fetch_inventory() -> list[dict]:
 
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
         while True:
-            variables = {"after": cursor} if cursor else {}
+            variables: dict[str, object] = {"after": cursor} if cursor else {}
             data = await _graphql_request(INVENTORY_QUERY, variables, client=client)
 
             inventory = data.get("inventory", {}).get("data", {})
@@ -214,14 +236,16 @@ async def fetch_inventory() -> list[dict]:
                 if not sku:
                     continue
                 for wp in node.get("warehouse_products", []):
-                    all_items.append({
-                        "sku": sku,
-                        "warehouse_id": wp.get("warehouse_id"),
-                        "warehouse": wp.get("warehouse_identifier", ""),
-                        "on_hand": _safe_int(wp.get("on_hand")),
-                        "allocated": _safe_int(wp.get("allocated")),
-                        "available": _safe_int(wp.get("available")),
-                    })
+                    all_items.append(
+                        {
+                            "sku": sku,
+                            "warehouse_id": wp.get("warehouse_id"),
+                            "warehouse": wp.get("warehouse_identifier", ""),
+                            "on_hand": _safe_int(wp.get("on_hand")),
+                            "allocated": _safe_int(wp.get("allocated")),
+                            "available": _safe_int(wp.get("available")),
+                        }
+                    )
 
             page_info = inventory.get("pageInfo", {})
             if page_info.get("hasNextPage"):
@@ -234,14 +258,22 @@ async def fetch_inventory() -> list[dict]:
 
 
 async def fetch_open_purchase_orders() -> list[dict]:
-    """Fetch open purchase orders with expected receipt dates."""
+    """Fetch open purchase orders. Returns an empty list when no token is set."""
+    from app.config import is_placeholder_secret
+
+    if is_placeholder_secret(settings.shiphero_api_token):
+        logger.info("ShipHero token is not configured; skipping open purchase orders")
+        return []
+
     all_pos = []
     cursor = None
 
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
         while True:
-            variables = {"after": cursor} if cursor else {}
-            data = await _graphql_request(PURCHASE_ORDERS_QUERY, variables, client=client)
+            variables: dict[str, object] = {"after": cursor} if cursor else {}
+            data = await _graphql_request(
+                PURCHASE_ORDERS_QUERY, variables, client=client
+            )
 
             pos = data.get("purchase_orders", {}).get("data", {})
             edges = pos.get("edges", [])
@@ -253,21 +285,27 @@ async def fetch_open_purchase_orders() -> list[dict]:
                 line_items = []
                 for li_edge in (node.get("line_items") or {}).get("edges", []):
                     li_node = li_edge.get("node", {})
-                    line_items.append({
-                        "sku": li_node.get("sku"),
-                        "quantity": _safe_int(li_node.get("quantity")),
-                        "quantity_received": _safe_int(li_node.get("quantity_received")),
-                        "price": li_node.get("price"),
-                    })
-                all_pos.append({
-                    "id": node.get("id"),
-                    "po_number": node.get("po_number"),
-                    "warehouse_id": node.get("warehouse_id"),
-                    "po_date": node.get("po_date"),
-                    "date_expected": node.get("date_expected"),
-                    "status": node.get("fulfillment_status"),
-                    "line_items": line_items,
-                })
+                    line_items.append(
+                        {
+                            "sku": li_node.get("sku"),
+                            "quantity": _safe_int(li_node.get("quantity")),
+                            "quantity_received": _safe_int(
+                                li_node.get("quantity_received")
+                            ),
+                            "price": li_node.get("price"),
+                        }
+                    )
+                all_pos.append(
+                    {
+                        "id": node.get("id"),
+                        "po_number": node.get("po_number"),
+                        "warehouse_id": node.get("warehouse_id"),
+                        "po_date": node.get("po_date"),
+                        "date_expected": node.get("date_expected"),
+                        "status": node.get("fulfillment_status"),
+                        "line_items": line_items,
+                    }
+                )
 
             page_info = pos.get("pageInfo", {})
             if page_info.get("hasNextPage"):
@@ -283,15 +321,17 @@ async def fetch_recent_adjustments(days: int = 30) -> list[dict]:
     """Fetch inventory adjustments from the last N days."""
     adjustments = []
     cursor = None
-    date_from = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-    date_to = datetime.now(timezone.utc).isoformat()
+    date_from = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+    date_to = datetime.now(UTC).isoformat()
 
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
         while True:
-            variables = {"date_from": date_from, "date_to": date_to}
+            variables: dict[str, object] = {"date_from": date_from, "date_to": date_to}
             if cursor:
                 variables["after"] = cursor
-            data = await _graphql_request(INVENTORY_CHANGES_QUERY, variables, client=client)
+            data = await _graphql_request(
+                INVENTORY_CHANGES_QUERY, variables, client=client
+            )
 
             changes = data.get("inventory_changes", {}).get("data", {})
             edges = changes.get("edges", [])
@@ -354,7 +394,16 @@ async def sync_inventory() -> int:
 
 
 async def full_sync() -> dict:
-    """Run full ShipHero sync."""
+    """Run a full ShipHero sync, or skip when no API token is configured."""
+    from app.config import is_placeholder_secret
+
+    if is_placeholder_secret(settings.shiphero_api_token):
+        logger.info("ShipHero sync skipped: API token is not configured")
+        return {
+            "inventory_synced": 0,
+            "open_purchase_orders": 0,
+            "recent_adjustments": 0,
+        }
     inventory_count = await sync_inventory()
     purchase_orders = await fetch_open_purchase_orders()
     adjustments = await fetch_recent_adjustments()

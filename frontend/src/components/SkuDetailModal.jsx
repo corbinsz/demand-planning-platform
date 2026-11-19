@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { BarChart, Bar, AreaChart, Area, ReferenceLine, XAxis, YAxis, CartesianGrid, ResponsiveContainer, Tooltip } from 'recharts'
+import { BarChart, Bar, AreaChart, Area, XAxis, YAxis, CartesianGrid, ResponsiveContainer, Tooltip } from 'recharts'
 import { getSkuDetail, getSkuForecast, updateReorderRule } from '../services/api'
 import InfoTooltip from './shared/InfoTooltip'
 

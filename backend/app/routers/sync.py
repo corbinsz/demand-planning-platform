@@ -1,13 +1,13 @@
 import logging
 import time
-from datetime import datetime, timezone
+from typing import TypedDict
 
 import httpx
-from fastapi import APIRouter, Depends, BackgroundTasks
-from sqlalchemy import select, func
+from fastapi import APIRouter, BackgroundTasks, Depends
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import get_settings
+from app.config import get_settings, is_placeholder_secret
 from app.database import get_db
 from app.models.models import JobLog
 
@@ -15,11 +15,18 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 router = APIRouter()
 
+
+class _SyncState(TypedDict):
+    running: bool
+    last_result: dict | None
+    started_at: float
+
+
 # Track running sync status in memory
 _SYNC_TIMEOUT = 600  # 10 minutes max before considering a sync stuck
-_sync_status = {
-    "shopify": {"running": False, "last_result": None, "started_at": 0},
-    "shiphero": {"running": False, "last_result": None, "started_at": 0},
+_sync_status: dict[str, _SyncState] = {
+    "shopify": {"running": False, "last_result": None, "started_at": 0.0},
+    "shiphero": {"running": False, "last_result": None, "started_at": 0.0},
 }
 
 
@@ -36,7 +43,12 @@ async def sync_status(db: AsyncSession = Depends(get_db)):
     """Get last sync times and status for all sources."""
     # Last successful job per type
     jobs = {}
-    for job_name in ["shopify_full_sync", "shiphero_sync", "forecasting", "reconciliation"]:
+    for job_name in [
+        "shopify_full_sync",
+        "shiphero_sync",
+        "forecasting",
+        "reconciliation",
+    ]:
         result = await db.execute(
             select(JobLog)
             .where(JobLog.job_name == job_name)
@@ -53,7 +65,13 @@ async def sync_status(db: AsyncSession = Depends(get_db)):
                 "error": job.error_message,
             }
         else:
-            jobs[job_name] = {"status": "never_run", "started_at": None, "finished_at": None, "records_processed": None, "error": None}
+            jobs[job_name] = {
+                "status": "never_run",
+                "started_at": None,
+                "finished_at": None,
+                "records_processed": None,
+                "error": None,
+            }
 
     return {
         "jobs": jobs,
@@ -71,8 +89,11 @@ async def test_shopify_connection():
         "Content-Type": "application/json",
     }
 
-    if settings.shopify_access_token == "shpat_placeholder":
-        return {"success": False, "error": "Shopify access token is still set to placeholder. Update SHOPIFY_ACCESS_TOKEN in backend/.env"}
+    if is_placeholder_secret(settings.shopify_access_token):
+        return {
+            "success": False,
+            "error": "Shopify access token is not set. Add SHOPIFY_ACCESS_TOKEN to your .env file.",
+        }
 
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -87,13 +108,25 @@ async def test_shopify_connection():
                     "currency": shop.get("currency"),
                 }
             elif resp.status_code == 401:
-                return {"success": False, "error": "Invalid access token. Check SHOPIFY_ACCESS_TOKEN in .env"}
+                return {
+                    "success": False,
+                    "error": "Invalid access token. Check SHOPIFY_ACCESS_TOKEN in .env",
+                }
             elif resp.status_code == 404:
-                return {"success": False, "error": f"Store not found: {settings.shopify_store_domain}. Check SHOPIFY_STORE_DOMAIN in .env"}
+                return {
+                    "success": False,
+                    "error": f"Store not found: {settings.shopify_store_domain}. Check SHOPIFY_STORE_DOMAIN in .env",
+                }
             else:
-                return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text[:200]}"}
+                return {
+                    "success": False,
+                    "error": f"HTTP {resp.status_code}: {resp.text[:200]}",
+                }
     except httpx.ConnectError:
-        return {"success": False, "error": f"Cannot connect to {settings.shopify_store_domain}. Check the domain."}
+        return {
+            "success": False,
+            "error": f"Cannot connect to {settings.shopify_store_domain}. Check the domain.",
+        }
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -101,10 +134,13 @@ async def test_shopify_connection():
 @router.post("/test-shiphero")
 async def test_shiphero_connection():
     """Test ShipHero API connection with current credentials."""
-    if settings.shiphero_api_token == "placeholder_token":
-        return {"success": False, "error": "ShipHero API token is still set to placeholder. Update SHIPHERO_API_TOKEN in backend/.env"}
+    if is_placeholder_secret(settings.shiphero_api_token):
+        return {
+            "success": False,
+            "error": "ShipHero API token is not set. Add SHIPHERO_API_TOKEN to your .env file.",
+        }
 
-    query = '{ account { id legacy_id } }'
+    query = "{ account { id legacy_id } }"
     headers = {
         "Authorization": f"Bearer {settings.shiphero_api_token}",
         "Content-Type": "application/json",
@@ -120,7 +156,12 @@ async def test_shiphero_connection():
             if resp.status_code == 200:
                 data = resp.json()
                 if "errors" in data:
-                    return {"success": False, "error": data["errors"][0].get("message", "Unknown GraphQL error")}
+                    return {
+                        "success": False,
+                        "error": data["errors"][0].get(
+                            "message", "Unknown GraphQL error"
+                        ),
+                    }
                 account = data.get("data", {}).get("account", {})
                 return {
                     "success": True,
@@ -128,9 +169,15 @@ async def test_shiphero_connection():
                     "legacy_id": account.get("legacy_id"),
                 }
             elif resp.status_code == 401:
-                return {"success": False, "error": "Invalid API token. Check SHIPHERO_API_TOKEN in .env"}
+                return {
+                    "success": False,
+                    "error": "Invalid API token. Check SHIPHERO_API_TOKEN in .env",
+                }
             else:
-                return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text[:200]}"}
+                return {
+                    "success": False,
+                    "error": f"HTTP {resp.status_code}: {resp.text[:200]}",
+                }
     except httpx.ConnectError:
         return {"success": False, "error": "Cannot connect to ShipHero API."}
     except Exception as e:
@@ -143,6 +190,7 @@ async def _run_shopify_sync():
     _sync_status["shopify"]["started_at"] = time.time()
     try:
         from app.services.shopify_sync import full_sync
+
         result = await full_sync()
         _sync_status["shopify"]["last_result"] = {"success": True, **result}
     except Exception as e:
@@ -159,6 +207,7 @@ async def _run_shiphero_sync():
     _sync_status["shiphero"]["started_at"] = time.time()
     try:
         from app.services.shiphero_sync import full_sync
+
         result = await full_sync()
         _sync_status["shiphero"]["last_result"] = {"success": True, **result}
     except Exception as e:

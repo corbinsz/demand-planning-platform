@@ -1,10 +1,10 @@
 from app.models.models import (
-    Product,
+    InventorySnapshot,
+    JobLog,
     Order,
     OrderLineItem,
-    InventorySnapshot,
+    Product,
     ReorderRule,
-    JobLog,
 )
 
 __all__ = [

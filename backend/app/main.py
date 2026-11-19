@@ -1,19 +1,33 @@
+"""FastAPI application for the demand planning demo."""
+
 import logging
 from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
 from app.config import get_settings
-from app.routers import dashboard, inventory, forecasting, purchase_orders, analytics, sync, promotions
-from app.services.scheduler import start_scheduler, shutdown_scheduler
+from app.logging_config import configure_logging
+from app.routers import (
+    analytics,
+    dashboard,
+    forecasting,
+    inventory,
+    promotions,
+    purchase_orders,
+    sync,
+)
+from app.services.scheduler import shutdown_scheduler, start_scheduler
 
 settings = get_settings()
-logging.basicConfig(level=getattr(logging, settings.log_level))
+configure_logging(settings.log_level)
 logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     from app.database import init_db
+
     logger.info("Initializing database...")
     await init_db()
     logger.info("Starting scheduler...")
@@ -25,7 +39,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Inventory Intel — Demand Planning",
-    description="AI-powered demand forecasting and inventory planning for Shopify + ShipHero stores. Predict what to reorder, when to reorder it, and how much.",
+    description=(
+        "Demand forecasting and inventory planning for a Shopify store and a "
+        "ShipHero warehouse. Predict what to reorder, when, and how much. "
+        "Personal project. The bundled catalog is synthetic."
+    ),
     version="1.0.0",
     lifespan=lifespan,
 )
