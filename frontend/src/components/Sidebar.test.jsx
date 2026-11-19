@@ -14,6 +14,7 @@ describe('Sidebar', () => {
     expect(screen.getByRole('link', { name: /Inventory/ })).toHaveAttribute('href', '/inventory')
     expect(screen.getByRole('link', { name: /Forecasting/ })).toHaveAttribute('href', '/forecasting')
     expect(screen.getByRole('link', { name: /Purchase Orders/ })).toHaveAttribute('href', '/purchase-orders')
+    expect(screen.getByText('Demand Planning Platform')).toBeInTheDocument()
     expect(screen.getByText('Synthetic demo')).toBeInTheDocument()
   })
 })

@@ -20,6 +20,7 @@ export const getSkuDetail = (sku) => api.get(`/inventory/sku/${encodeURIComponen
 export const getForecasts = (params) => api.get('/forecasting', { params })
 export const getSkuForecast = (sku) => api.get(`/forecasting/${encodeURIComponent(sku)}`)
 export const getReorderAlerts = () => api.get('/forecasting/alerts')
+export const getForecastBacktest = () => api.get('/forecasting/backtest')
 
 // Purchase Orders
 export const getPurchaseOrders = () => api.get('/purchase-orders')

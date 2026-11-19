@@ -4,7 +4,7 @@ import os
 import tempfile
 from pathlib import Path
 
-ROOT = Path(tempfile.mkdtemp(prefix="inventory-intel-"))
+ROOT = Path(tempfile.mkdtemp(prefix="demand-planning-"))
 DB_PATH = ROOT / "test.db"
 
 os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{DB_PATH}"

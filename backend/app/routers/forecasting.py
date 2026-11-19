@@ -4,6 +4,7 @@ from dataclasses import asdict
 from fastapi import APIRouter, HTTPException, Query
 
 from app.database import async_session
+from app.services.backtest import run_backtest
 from app.services.forecasting import (
     SKUForecast,
     generate_all_forecasts,
@@ -102,6 +103,19 @@ async def reorder_alerts():
         )
     )
     return {"items": items, "total": len(items)}
+
+
+@router.get("/backtest")
+async def forecast_backtest():
+    """Rolling-origin WAPE and bias for Holt-Winters and a seasonal-naive baseline."""
+    try:
+        report = await run_backtest()
+    except Exception as e:
+        logger.error(f"Forecast backtest failed: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to score forecast accuracy: {e}"
+        )
+    return asdict(report)
 
 
 @router.get("/{sku}")

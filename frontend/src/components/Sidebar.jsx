@@ -54,12 +54,9 @@ export default function Sidebar() {
             <svg width="16" height="16" fill="white" viewBox="0 0 24 24"><path d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4"/></svg>
           </div>
           <div>
-            <h1 style={{ fontSize: '15px', fontWeight: 700, color: '#fff', fontFamily: 'Poppins, sans-serif', lineHeight: 1.2 }}>
-              Inventory Intel
+            <h1 style={{ fontSize: '14px', fontWeight: 700, color: '#fff', fontFamily: 'Poppins, sans-serif', lineHeight: 1.25 }}>
+              Demand Planning Platform
             </h1>
-            <span style={{ fontSize: '10px', color: 'rgba(255,255,255,0.4)', letterSpacing: '0.5px' }}>
-              DEMAND PLANNING
-            </span>
             <span style={{ display: 'block', fontSize: '10px', color: 'rgba(255,255,255,0.45)', marginTop: '2px' }}>
               Synthetic demo
             </span>

@@ -21,6 +21,7 @@ def client():
 @pytest.fixture(autouse=True)
 def _clean_database(client):
     """Each test starts from an empty catalog and an empty forecast cache."""
+    from app.services.backtest import clear_backtest_cache
     from app.services.forecasting import clear_forecast_cache
 
     connection = sqlite3.connect(DB_PATH)
@@ -39,4 +40,5 @@ def _clean_database(client):
     connection.commit()
     connection.close()
     clear_forecast_cache()
+    clear_backtest_cache()
     yield
